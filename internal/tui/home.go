@@ -4,6 +4,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
@@ -14,7 +15,15 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/hugs7/jira-cli/internal/api"
+	"github.com/hugs7/jira-cli/internal/cache"
 	"github.com/hugs7/jira-cli/internal/config"
+)
+
+// boardsCacheKey / boardsCacheTTL are shared by the home model and
+// any future code that wants to share the same on-disk cache.
+const (
+	boardsCacheKey = "boards"
+	boardsCacheTTL = 1 * time.Hour
 )
 
 // HomeAction tells the caller what the user picked from the dashboard.
@@ -110,6 +119,7 @@ type homeModel struct {
 	boardsFiltered []api.Board // re-derived after every filter change
 	boardsLoaded   bool
 	boardsLoading  bool
+	boardsCacheAge time.Duration // 0 → fresh from server
 	boardCursor    int
 	boardsFilter   textinput.Model
 	boardsFocus    bool // typing in the boards filter
@@ -196,8 +206,9 @@ type searchDoneMsg struct {
 }
 
 type boardsLoadedMsg struct {
-	boards []api.Board
-	err    error
+	boards   []api.Board
+	cacheAge time.Duration // 0 when fetched fresh
+	err      error
 }
 
 func (m *homeModel) fetchSection(idx int, loader func(int) ([]api.Issue, error)) tea.Cmd {
@@ -214,10 +225,27 @@ func (m *homeModel) runSearch(jql string) tea.Cmd {
 	}
 }
 
-func (m *homeModel) fetchBoards() tea.Cmd {
+// fetchBoards consults the on-disk cache first; if the entry is fresh
+// it returns instantly, otherwise it paginates through every board on
+// the host and writes the result to the cache. forceRefresh skips the
+// read-side check (used by the Boards-tab `r` keybind).
+func (m *homeModel) fetchBoards(forceRefresh bool) tea.Cmd {
 	svc := m.svc
+	host := svc.Host()
 	return func() tea.Msg {
-		bs, err := svc.ListBoards("", "", 500)
+		if !forceRefresh {
+			var cached []api.Board
+			if cache.Get(host, boardsCacheKey, boardsCacheTTL, &cached) {
+				age, _ := cache.Age(host, boardsCacheKey)
+				return boardsLoadedMsg{boards: cached, cacheAge: age}
+			}
+		} else {
+			_ = cache.Invalidate(host, boardsCacheKey)
+		}
+		bs, err := svc.ListBoards("", "", 0) // 0 → fetch all pages
+		if err == nil {
+			_ = cache.Put(host, boardsCacheKey, bs)
+		}
 		return boardsLoadedMsg{boards: bs, err: err}
 	}
 }
@@ -294,6 +322,7 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.boards = msg.boards
+		m.boardsCacheAge = msg.cacheAge
 		m.applyBoardsFilter()
 		m.vp.SetContent(m.renderBody())
 		return m, nil
@@ -342,7 +371,7 @@ func (m homeModel) switchTab(t homeTab) (tea.Model, tea.Cmd) {
 	m.vp.GotoTop()
 	if t == tabBoards && !m.boardsLoaded && !m.boardsLoading {
 		m.boardsLoading = true
-		return m, tea.Batch(m.spinner.Tick, m.fetchBoards())
+		return m, tea.Batch(m.spinner.Tick, m.fetchBoards(false))
 	}
 	return m, nil
 }
@@ -487,7 +516,7 @@ func (m homeModel) updateBoardsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Refresh):
 		m.boardsLoading = true
 		m.boardsLoaded = false
-		return m, tea.Batch(m.spinner.Tick, m.fetchBoards())
+		return m, tea.Batch(m.spinner.Tick, m.fetchBoards(true))
 	case key.Matches(msg, m.keys.Enter):
 		if b, ok := m.boardAtCursor(); ok {
 			m.action = &HomeAction{Kind: "board", BoardID: b.ID}
@@ -713,11 +742,17 @@ func (m homeModel) renderSubBar() string {
 			return m.boardsFilter.View()
 		}
 		count := paneMutedStyle.Render(fmt.Sprintf("%d / %d boards", len(m.boardsFiltered), len(m.boards)))
+		freshness := ""
+		if m.boardsCacheAge > 0 {
+			freshness = paneMutedStyle.Render(" · cached " + humanDuration(m.boardsCacheAge) + " ago")
+		} else if m.boardsLoaded {
+			freshness = paneMutedStyle.Render(" · fresh")
+		}
 		hint := paneMutedStyle.Render("   /  filter · enter open · r refresh")
 		if v := m.boardsFilter.Value(); v != "" {
-			return paneMutedStyle.Render("filter: "+v+"   ") + count + hint
+			return paneMutedStyle.Render("filter: "+v+"   ") + count + freshness + hint
 		}
-		return count + hint
+		return count + freshness + hint
 	}
 	return ""
 }
@@ -842,6 +877,22 @@ func padRight(s string, w int) string {
 		return s[:w]
 	}
 	return s + strings.Repeat(" ", w-len(s))
+}
+
+// humanDuration prints a Duration in coarse units suitable for a UI
+// hint ("3m", "2h", "5d") — Time-since-cache age rather than precise
+// elapsed time.
+func humanDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
 }
 
 func truncErr(s string) string {
