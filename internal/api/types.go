@@ -61,10 +61,22 @@ type User struct {
 // IssueLink describes a link between two issues (blocks, relates to,
 // duplicates, etc.).
 type IssueLink struct {
+	ID        string // Jira link id, needed for deletion
 	Type      string // human "blocks" / "is blocked by" / "relates to"
 	OtherKey  string
 	OtherSum  string
 	Direction string // "inward" or "outward"
+}
+
+// IssueLinkType is one entry in the link-type catalogue (e.g.
+// "Blocks") with both verb forms. Inward is what reads naturally on
+// the *target* side ("is blocked by"), Outward on the source side
+// ("blocks").
+type IssueLinkType struct {
+	ID      string
+	Name    string // canonical name used by the API ("Blocks")
+	Inward  string // human verb on inward side
+	Outward string // human verb on outward side
 }
 
 // Project is a workspace-level container for issues.

@@ -73,6 +73,7 @@ type srvFields struct {
 }
 
 type srvIssueLink struct {
+	ID   string `json:"id"`
 	Type struct {
 		Name    string `json:"name"`
 		Inward  string `json:"inward"`
@@ -692,6 +693,7 @@ func (s *serverService) ListLinks(key string) ([]IssueLink, error) {
 		switch {
 		case l.OutwardIssue != nil:
 			out = append(out, IssueLink{
+				ID:        l.ID,
 				Type:      l.Type.Outward,
 				OtherKey:  l.OutwardIssue.Key,
 				OtherSum:  l.OutwardIssue.Fields.Summary,
@@ -699,6 +701,7 @@ func (s *serverService) ListLinks(key string) ([]IssueLink, error) {
 			})
 		case l.InwardIssue != nil:
 			out = append(out, IssueLink{
+				ID:        l.ID,
 				Type:      l.Type.Inward,
 				OtherKey:  l.InwardIssue.Key,
 				OtherSum:  l.InwardIssue.Fields.Summary,
@@ -707,6 +710,51 @@ func (s *serverService) ListLinks(key string) ([]IssueLink, error) {
 		}
 	}
 	return out, nil
+}
+
+// ListIssueLinkTypes hits /rest/api/2/issueLinkType which is the
+// canonical catalogue. Returns inward+outward verbs so the picker
+// can offer both directions.
+func (s *serverService) ListIssueLinkTypes() ([]IssueLinkType, error) {
+	var raw struct {
+		IssueLinkTypes []struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Inward  string `json:"inward"`
+			Outward string `json:"outward"`
+		} `json:"issueLinkTypes"`
+	}
+	if err := s.client.getJSON("issueLinkType", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]IssueLinkType, 0, len(raw.IssueLinkTypes))
+	for _, t := range raw.IssueLinkTypes {
+		out = append(out, IssueLinkType{
+			ID: t.ID, Name: t.Name, Inward: t.Inward, Outward: t.Outward,
+		})
+	}
+	return out, nil
+}
+
+// AddIssueLink creates a link via POST /issueLink. Direction
+// determines which side is "inward" vs "outward" — the API takes
+// inwardIssue + outwardIssue keys explicitly.
+func (s *serverService) AddIssueLink(fromKey, toKey, typeName, direction string) error {
+	inward, outward := fromKey, toKey
+	if direction == "inward" {
+		inward, outward = toKey, fromKey
+	}
+	body := map[string]any{
+		"type":         map[string]string{"name": typeName},
+		"inwardIssue":  map[string]string{"key": inward},
+		"outwardIssue": map[string]string{"key": outward},
+	}
+	return s.client.postJSON("issueLink", body, nil)
+}
+
+// DeleteIssueLink calls DELETE /issueLink/{id}.
+func (s *serverService) DeleteIssueLink(linkID string) error {
+	return s.client.deleteJSON("issueLink/" + linkID)
 }
 
 func (s *serverService) ListProjects() ([]Project, error) {

@@ -91,6 +91,17 @@ type Service interface {
 	DoTransition(key, transitionID string) error
 
 	ListLinks(key string) ([]IssueLink, error)
+	// ListIssueLinkTypes returns the catalogue of link types
+	// configured on the instance ("Blocks", "Relates", …).
+	ListIssueLinkTypes() ([]IssueLinkType, error)
+	// AddIssueLink creates a link between two issues. typeName must
+	// be the canonical link-type name (e.g. "Blocks"). When
+	// direction == "outward" the source is fromKey; when "inward"
+	// the source is toKey (Jira flips the relationship for you).
+	AddIssueLink(fromKey, toKey, typeName, direction string) error
+	// DeleteIssueLink removes a link by its Jira id (from IssueLink.ID).
+	DeleteIssueLink(linkID string) error
+
 	ListProjects() ([]Project, error)
 
 	// Dashboard helpers — each returns the freshest results first.
