@@ -80,6 +80,11 @@ type boardModel struct {
 	// picker is the active modal overlay (currently used only by the
 	// inline "create issue" flow). nil when no picker is open.
 	picker *pickerModel
+
+	// selected is the set of multi-selected issue keys (set by v/V).
+	// Bulk actions like H/L drag operate on this set when non-empty,
+	// otherwise on just the cursor card.
+	selected map[string]bool
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
@@ -87,13 +92,14 @@ func newBoardModel(svc api.Service, boardID int) boardModel {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
 	return boardModel{
-		svc:     svc,
-		boardID: boardID,
-		spinner: sp,
-		help:    help.New(),
-		keys:    defaultBoardKeys(),
-		loading: 2, // config + sprints
-		vp:      viewport.New(0, 0),
+		svc:      svc,
+		boardID:  boardID,
+		spinner:  sp,
+		help:     help.New(),
+		keys:     defaultBoardKeys(),
+		loading:  2, // config + sprints
+		vp:       viewport.New(0, 0),
+		selected: map[string]bool{},
 	}
 }
 
@@ -159,18 +165,14 @@ func (m *boardModel) fetchIssues() tea.Cmd {
 	}
 }
 
-// moveCardCmd transitions the focused card into a status that maps
+// moveCardCmd transitions one or more cards into a status that maps
 // to the column `dir` away from the current one (-1 = left, +1 =
-// right). It looks up the available transitions for the issue and
-// picks the first one whose destination status sits in the target
-// column's status set; columns that have no usable transition leave
-// a status message rather than failing silently.
+// right). When the multi-select set is non-empty it operates on
+// every selected card; otherwise it falls back to the focused card.
+// Each card's transition list is fetched independently because Jira
+// returns workflow-relative transitions per issue.
 func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 	if m.cfg == nil {
-		return nil
-	}
-	iss, ok := m.cardAtCursor()
-	if !ok {
 		return nil
 	}
 	target := m.colCursor + dir
@@ -183,36 +185,85 @@ func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 		m.status = fmt.Sprintf("column %q has no statuses mapped", col.Name)
 		return nil
 	}
+	keys := m.bulkOrCursorKeys()
+	if len(keys) == 0 {
+		return nil
+	}
 	svc := m.svc
-	key := iss.Key
 	colName := col.Name
 	wanted := map[string]bool{}
 	for _, k := range col.StatusKeys {
 		wanted[strings.ToLower(k)] = true
 	}
-	label := fmt.Sprintf("%s → %s", key, colName)
+	var label string
+	if len(keys) == 1 {
+		label = fmt.Sprintf("%s → %s", keys[0], colName)
+	} else {
+		label = fmt.Sprintf("%d cards → %s", len(keys), colName)
+	}
 	m.loading++
 	return func() tea.Msg {
-		ts, err := svc.ListTransitions(key)
-		if err != nil {
-			return cardMovedMsg{label: label, err: err}
-		}
-		var pickID string
-		for _, t := range ts {
-			if wanted[strings.ToLower(t.To)] {
-				pickID = t.ID
-				break
+		var firstErr error
+		for _, key := range keys {
+			ts, err := svc.ListTransitions(key)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s: %w", key, err)
+				}
+				continue
+			}
+			var pickID string
+			for _, t := range ts {
+				if wanted[strings.ToLower(t.To)] {
+					pickID = t.ID
+					break
+				}
+			}
+			if pickID == "" {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s: no transition into %q", key, colName)
+				}
+				continue
+			}
+			if err := svc.DoTransition(key, pickID); err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s: %w", key, err)
+				}
 			}
 		}
-		if pickID == "" {
-			return cardMovedMsg{label: label,
-				err: fmt.Errorf("no transition into column %q is available", colName)}
-		}
-		if err := svc.DoTransition(key, pickID); err != nil {
-			return cardMovedMsg{label: label, err: err}
-		}
-		return cardMovedMsg{label: label}
+		return cardMovedMsg{label: label, err: firstErr}
 	}
+}
+
+// selectionLabel renders the selection-count chip used in the
+// status footer; "" when nothing is selected so the footer hides.
+func (m *boardModel) selectionLabel() string {
+	if len(m.selected) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d selected", len(m.selected))
+}
+
+// bulkOrCursorKeys returns the multi-select set in stable display
+// order when non-empty; otherwise the single focused card's key.
+// Falling back to the cursor lets every shortcut behave the same
+// whether or not the user has explicitly selected cards.
+func (m *boardModel) bulkOrCursorKeys() []string {
+	if len(m.selected) > 0 {
+		out := []string{}
+		for _, col := range m.grouped {
+			for _, iss := range col {
+				if m.selected[iss.Key] {
+					out = append(out, iss.Key)
+				}
+			}
+		}
+		return out
+	}
+	if iss, ok := m.cardAtCursor(); ok {
+		return []string{iss.Key}
+	}
+	return nil
 }
 
 // openCreatePicker opens a free-text picker for the user to type a
@@ -386,6 +437,9 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.status = "✓ " + msg.label
+		// Clear the multi-select set: those cards have moved and
+		// keeping them selected on the next view is rarely useful.
+		m.selected = map[string]bool{}
 		m.layout()
 		// The card has changed status; refetch the board so the
 		// regroup picks up the new column placement.
@@ -509,6 +563,41 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if cmd := m.openCreatePicker(); cmd != nil {
 				return m, tea.Batch(m.spinner.Tick, cmd)
 			}
+			return m, nil
+		case key.Matches(msg, m.keys.SelectToggle):
+			if iss, ok := m.cardAtCursor(); ok {
+				if m.selected[iss.Key] {
+					delete(m.selected, iss.Key)
+				} else {
+					m.selected[iss.Key] = true
+				}
+				m.status = m.selectionLabel()
+				m.layout()
+				m.composeBody()
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.SelectColumn):
+			// Toggle whole-column: if any card in the focused
+			// column is already selected, clear them; otherwise
+			// select the lot.
+			cards := m.currentColIssues()
+			anySelected := false
+			for _, iss := range cards {
+				if m.selected[iss.Key] {
+					anySelected = true
+					break
+				}
+			}
+			for _, iss := range cards {
+				if anySelected {
+					delete(m.selected, iss.Key)
+				} else {
+					m.selected[iss.Key] = true
+				}
+			}
+			m.status = m.selectionLabel()
+			m.layout()
+			m.composeBody()
 			return m, nil
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
@@ -1013,16 +1102,23 @@ func (m *boardModel) renderColumnCards(idx, width int) string {
 	blocks := make([]string, 0, len(m.grouped[idx]))
 	for ri, iss := range m.grouped[idx] {
 		selected := idx == m.colCursor && ri == m.rowCursor
-		blocks = append(blocks, renderBoardCard(iss, width, selected))
+		marked := m.selected[iss.Key]
+		blocks = append(blocks, renderBoardCard(iss, width, selected, marked))
 	}
 	col := lipgloss.JoinVertical(lipgloss.Left, blocks...)
 	return lipgloss.NewStyle().Width(width).Render(col)
 }
 
-func renderBoardCard(iss api.Issue, width int, selected bool) string {
+func renderBoardCard(iss api.Issue, width int, selected, marked bool) string {
 	typeCol := issueTypeColor(iss.IssueType)
 	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(typeCol)
 	keyLine := keyStyle.Render(iss.Key)
+	if marked {
+		// Bright check mark prefix so multi-selected cards are
+		// instantly recognisable irrespective of cursor position.
+		check := lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true).Render("✓ ")
+		keyLine = check + keyLine
+	}
 	if iss.IssueType != "" {
 		keyLine += " " + lipgloss.NewStyle().Foreground(typeCol).Render("· "+iss.IssueType)
 	}
@@ -1046,10 +1142,15 @@ func renderBoardCard(iss api.Issue, width int, selected bool) string {
 	body := keyLine + "\n" + summary + "\n" + metaLine
 
 	style := cardBase.BorderForeground(typeCol)
-	if selected {
+	switch {
+	case selected:
 		// Brighter, thick border in the issue type's accent colour
 		// so selection still pops without losing the type cue.
 		style = cardSelBase.BorderForeground(lipgloss.Color("11"))
+	case marked:
+		// Multi-selected but not focused — yellow outline so the
+		// bulk set is visible at a glance.
+		style = cardBase.BorderForeground(lipgloss.Color("11"))
 	}
 	return style.Width(width - 2).Render(body)
 }
@@ -1151,6 +1252,7 @@ type boardKeys struct {
 	FirstCol, LastCol            key.Binding // 0 / $
 	MoveLeft, MoveRight          key.Binding // H / L — drag card
 	Create                       key.Binding // c — inline new issue
+	SelectToggle, SelectColumn   key.Binding // v / V — bulk select
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
 	Help, Quit                   key.Binding
@@ -1173,6 +1275,8 @@ func defaultBoardKeys() boardKeys {
 		MoveLeft:  key.NewBinding(key.WithKeys("H"), key.WithHelp("H", "drag card left")),
 		MoveRight: key.NewBinding(key.WithKeys("L"), key.WithHelp("L", "drag card right")),
 		Create:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "create issue…")),
+		SelectToggle: key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "select card")),
+		SelectColumn: key.NewBinding(key.WithKeys("V"), key.WithHelp("V", "select column")),
 		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
@@ -1189,7 +1293,7 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom, k.FirstCol, k.LastCol},
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
-		{k.MoveLeft, k.MoveRight, k.Create},
+		{k.MoveLeft, k.MoveRight, k.Create, k.SelectToggle, k.SelectColumn},
 		{k.Sprint, k.Refresh, k.Help, k.Quit},
 	}
 }
