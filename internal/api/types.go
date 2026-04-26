@@ -72,6 +72,17 @@ type Project struct {
 	Name string
 }
 
+// NamedItem is a generic {id, name, description} triple used for
+// catalogue lookups (priorities, issue types, …) that feed pickers.
+// IconURL is best-effort — Server returns one for priorities and
+// issue types; ignored when empty.
+type NamedItem struct {
+	ID          string
+	Name        string
+	Description string
+	IconURL     string
+}
+
 // SearchInput is the query for ListIssues / Search.
 type SearchInput struct {
 	JQL        string

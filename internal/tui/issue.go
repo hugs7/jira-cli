@@ -37,6 +37,7 @@ const (
 	modeLinks
 	modeConfirmDelete
 	modeTransitions
+	modePicker // generic picker overlay (assignee, priority, …)
 )
 
 type issueModel struct {
@@ -58,6 +59,12 @@ type issueModel struct {
 	transCur    int
 
 	pendingDeleteID string
+
+	// picker is the active modal overlay (assignee picker, priority,
+	// labels, …). nil when no picker is open. modeReturn is the mode
+	// to restore when the picker closes/cancels.
+	picker     *pickerModel
+	modeReturn issueMode
 
 	width, height int
 	loading       int
@@ -142,13 +149,21 @@ func (m issueModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		m.refreshContent()
+		if m.picker != nil {
+			m.picker.SetSize(m.width, m.height)
+		}
 		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		if m.loading > 0 {
-			return m, cmd
+		// Forward to the picker so its own loading spinner ticks too.
+		var pCmd tea.Cmd
+		if m.picker != nil {
+			pCmd, _ = m.picker.Update(msg)
+		}
+		if m.loading > 0 || m.picker != nil {
+			return m, tea.Batch(cmd, pCmd)
 		}
 		return m, nil
 
@@ -243,7 +258,28 @@ func (m issueModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case pickerLoadedMsg, pickerTickMsg:
+		if m.picker == nil {
+			return m, nil
+		}
+		cmd, _ := m.picker.Update(msg)
+		return m, cmd
+
+	case pickerDoneMsg:
+		m.picker = nil
+		m.mode = m.modeReturn
+		if msg.Cancelled {
+			m.status = "cancelled"
+			return m, nil
+		}
+		return m.applyPicker(msg)
+
 	case tea.KeyMsg:
+		// Picker eats all keys while open.
+		if m.picker != nil && m.mode == modePicker {
+			cmd, _ := m.picker.Update(msg)
+			return m, cmd
+		}
 		return m.handleKey(msg)
 	}
 	return m, nil
@@ -330,6 +366,18 @@ func (m issueModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.spinner.Tick, m.runAction("assigned to "+me, "issue", func() error {
 			return m.svc.AssignIssue(m.key, me)
 		}))
+	case key.Matches(msg, m.keys.AssignPick):
+		return m, m.openAssigneePicker()
+	case key.Matches(msg, m.keys.PickPriority):
+		return m, m.openPriorityPicker()
+	case key.Matches(msg, m.keys.PickType):
+		return m, m.openIssueTypePicker()
+	case key.Matches(msg, m.keys.PickSprint):
+		return m, m.openSprintPicker()
+	case key.Matches(msg, m.keys.EditLabels):
+		return m, m.openLabelsPicker()
+	case key.Matches(msg, m.keys.EditComponents):
+		return m, m.openComponentsPicker()
 	case key.Matches(msg, m.keys.Unassign):
 		m.loading++
 		return m, tea.Batch(m.spinner.Tick, m.runAction("unassigned", "issue", func() error {
@@ -541,6 +589,14 @@ func (m issueModel) View() string {
 
 	var body string
 	switch m.mode {
+	case modePicker:
+		// Centre the picker box over the body area. lipgloss.Place
+		// handles the vertical/horizontal maths so the modal stays
+		// nicely middle-screen as the window resizes.
+		body = lipgloss.Place(m.width, m.desc.Height,
+			lipgloss.Center, lipgloss.Center,
+			m.picker.View(),
+			lipgloss.WithWhitespaceChars(" "))
 	case modeComments:
 		body = m.commentsVP.View()
 	case modeLinks:
@@ -696,6 +752,288 @@ func humanTime(t time.Time) string {
 	}
 }
 
+// ---------- picker plumbing ----------
+
+// openAssigneePicker swaps the screen for an async user picker
+// scoped to this issue's assignable users. The first row is always
+// "(unassigned)" so users can clear the field without leaving the
+// picker; the second row is "Me" as a fast-path when the cursor is
+// already there.
+func (m *issueModel) openAssigneePicker() tea.Cmd {
+	loader := func(query string, token int) tea.Cmd {
+		key := m.key
+		svc := m.svc
+		return func() tea.Msg {
+			users, err := svc.SearchAssignableUsers(key, query, 25)
+			items := []PickerItem{
+				{Label: "(unassigned)", Sub: "clear assignee", Value: ""},
+			}
+			if me := svc.Me(); me != "" {
+				items = append(items, PickerItem{
+					Label: "Me", Sub: me, Value: me,
+				})
+			}
+			for _, u := range users {
+				val := u.AccountID
+				if val == "" {
+					val = u.Name
+				}
+				if val == "" {
+					continue
+				}
+				items = append(items, PickerItem{
+					Label: u.DisplayName,
+					Sub:   strings.TrimSpace(u.Name + "  " + u.Email),
+					Value: val,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("assignee", "Assign "+m.key+" to…", "type a name…", loader)
+	p.SetSize(m.width, m.height)
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// openPriorityPicker fetches the priority catalogue once and shows
+// it as a static-filter picker. The first row is "(none)" so the
+// user can clear the field without leaving the picker.
+func (m *issueModel) openPriorityPicker() tea.Cmd {
+	loader := func(query string, token int) tea.Cmd {
+		svc := m.svc
+		return func() tea.Msg {
+			items := []PickerItem{
+				{Label: "(none)", Sub: "clear priority", Value: ""},
+			}
+			ps, err := svc.ListPriorities()
+			for _, p := range ps {
+				items = append(items, PickerItem{
+					Label: p.Name, Sub: p.Description, Value: p.Name,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("priority", "Set priority for "+m.key, "filter…", loader)
+	p.SetSize(m.width, m.height)
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// openIssueTypePicker shows the project's issue types so the user
+// can re-classify (Story → Bug, Task → Sub-task, …). Driven by
+// project key from the loaded issue; falls back to the global
+// catalogue if the issue isn't loaded yet.
+func (m *issueModel) openIssueTypePicker() tea.Cmd {
+	projectKey := ""
+	if m.issue != nil {
+		projectKey = m.issue.Project
+	}
+	loader := func(query string, token int) tea.Cmd {
+		svc := m.svc
+		pk := projectKey
+		return func() tea.Msg {
+			ts, err := svc.ListIssueTypes(pk)
+			items := make([]PickerItem, 0, len(ts))
+			for _, t := range ts {
+				items = append(items, PickerItem{
+					Label: t.Name, Sub: t.Description, Value: t.Name,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("issuetype", "Change type of "+m.key, "filter…", loader)
+	p.SetSize(m.width, m.height)
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// openSprintPicker shows active+future sprints across the issue's
+// project, plus a "(backlog)" entry to remove the issue from any
+// sprint. Sprint listing requires walking all Scrum boards for the
+// project so it's cheaper to do once and let static filter take over.
+func (m *issueModel) openSprintPicker() tea.Cmd {
+	projectKey := ""
+	if m.issue != nil {
+		projectKey = m.issue.Project
+	}
+	loader := func(query string, token int) tea.Cmd {
+		svc := m.svc
+		pk := projectKey
+		return func() tea.Msg {
+			items := []PickerItem{
+				{Label: "(backlog)", Sub: "remove from sprint", Value: 0},
+			}
+			sps, err := svc.ListProjectSprints(pk, "active,future")
+			for _, sp := range sps {
+				items = append(items, PickerItem{
+					Label: sp.Name, Sub: sp.State, Value: sp.ID,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("sprint", "Move "+m.key+" to sprint…", "filter…", loader)
+	p.SetSize(m.width, m.height)
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// openLabelsPicker opens a multi-select chip editor over the
+// instance's label catalogue, pre-selecting the issue's current
+// labels. Free-text is enabled so the user can create a brand-new
+// label by typing it (Jira labels aren't gated by a catalogue).
+func (m *issueModel) openLabelsPicker() tea.Cmd {
+	loader := func(query string, token int) tea.Cmd {
+		svc := m.svc
+		return func() tea.Msg {
+			labels, err := svc.ListLabels(query, 50)
+			items := make([]PickerItem, 0, len(labels))
+			for _, l := range labels {
+				items = append(items, PickerItem{Label: l, Value: l})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("labels", "Labels for "+m.key, "type to filter / create…", loader)
+	p.SetSize(m.width, m.height)
+	pre := []any{}
+	if m.issue != nil {
+		for _, l := range m.issue.Labels {
+			pre = append(pre, l)
+		}
+	}
+	p.EnableMultiSelect(pre)
+	p.EnableFreeText()
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// openComponentsPicker opens a multi-select chip editor over the
+// project's component catalogue. Components must exist in the project
+// (free-text creation isn't available — that needs project-admin
+// permission and a different endpoint).
+func (m *issueModel) openComponentsPicker() tea.Cmd {
+	projectKey := ""
+	if m.issue != nil {
+		projectKey = m.issue.Project
+	}
+	loader := func(query string, token int) tea.Cmd {
+		svc := m.svc
+		pk := projectKey
+		return func() tea.Msg {
+			comps, err := svc.ListProjectComponents(pk)
+			items := make([]PickerItem, 0, len(comps))
+			for _, c := range comps {
+				items = append(items, PickerItem{
+					Label: c.Name, Sub: c.Description, Value: c.Name,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("components", "Components for "+m.key, "filter…", loader)
+	p.SetSize(m.width, m.height)
+	pre := []any{}
+	if m.issue != nil {
+		for _, c := range m.issue.Components {
+			pre = append(pre, c)
+		}
+	}
+	p.EnableMultiSelect(pre)
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// applyPicker dispatches a finished picker's value to the right API
+// call based on the picker's purpose. Adding a new picker = adding a
+// new case here + a corresponding open*Picker helper.
+func (m *issueModel) applyPicker(msg pickerDoneMsg) (tea.Model, tea.Cmd) {
+	switch msg.Purpose {
+	case "assignee":
+		val, _ := msg.Value.(string)
+		label := "unassigned"
+		if val != "" {
+			label = "assigned to " + val
+		}
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(label, "issue", func() error {
+			return m.svc.AssignIssue(m.key, val)
+		}))
+	case "priority":
+		val, _ := msg.Value.(string)
+		label := "priority cleared"
+		if val != "" {
+			label = "priority → " + val
+		}
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(label, "issue", func() error {
+			return m.svc.UpdatePriority(m.key, val)
+		}))
+	case "issuetype":
+		val, _ := msg.Value.(string)
+		if val == "" {
+			m.status = "✗ issue type cannot be empty"
+			return m, nil
+		}
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction("type → "+val, "issue", func() error {
+			return m.svc.UpdateIssueType(m.key, val)
+		}))
+	case "sprint":
+		id, _ := msg.Value.(int)
+		label := "moved to backlog"
+		if id > 0 {
+			label = fmt.Sprintf("moved to sprint %d", id)
+		}
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(label, "issue", func() error {
+			return m.svc.MoveIssueToSprint(m.key, id)
+		}))
+	case "labels":
+		labels := stringSliceFromAny(msg.Values)
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(
+			fmt.Sprintf("labels updated (%d)", len(labels)), "issue", func() error {
+				return m.svc.UpdateLabels(m.key, labels)
+			}))
+	case "components":
+		comps := stringSliceFromAny(msg.Values)
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(
+			fmt.Sprintf("components updated (%d)", len(comps)), "issue", func() error {
+				return m.svc.UpdateComponents(m.key, comps)
+			}))
+	}
+	return m, nil
+}
+
+// stringSliceFromAny converts a picker's []any value list to a
+// []string, dropping any non-string entries.
+func stringSliceFromAny(vs []any) []string {
+	out := make([]string, 0, len(vs))
+	for _, v := range vs {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // ---------- key map ----------
 
 type issueKeys struct {
@@ -704,7 +1042,9 @@ type issueKeys struct {
 	TabDesc, TabComments, TabLinks, TabTransitions key.Binding
 
 	OpenBrowser, EditDescription, EditSummary, NewComment key.Binding
-	AssignMe, Unassign                                    key.Binding
+	AssignMe, AssignPick, Unassign                        key.Binding
+	PickPriority, PickType, PickSprint                    key.Binding
+	EditLabels, EditComponents                            key.Binding
 	EditComment, DeleteComment, ConfirmYes, ConfirmNo     key.Binding
 }
 
@@ -726,7 +1066,13 @@ func defaultIssueKeys() issueKeys {
 		EditDescription: key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit desc")),
 		EditSummary:     key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "edit summary")),
 		AssignMe:        key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "assign me")),
+		AssignPick:      key.NewBinding(key.WithKeys("A"), key.WithHelp("A", "assign…")),
 		Unassign:        key.NewBinding(key.WithKeys("U"), key.WithHelp("U", "unassign")),
+		PickPriority:    key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "priority…")),
+		PickType:        key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "type…")),
+		PickSprint:      key.NewBinding(key.WithKeys("S"), key.WithHelp("S", "sprint…")),
+		EditLabels:      key.NewBinding(key.WithKeys("L"), key.WithHelp("L", "labels…")),
+		EditComponents:  key.NewBinding(key.WithKeys("C"), key.WithHelp("C", "components…")),
 		NewComment:      key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new comment")),
 		EditComment:     key.NewBinding(key.WithKeys("E"), key.WithHelp("E", "edit comment")),
 		DeleteComment:   key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete comment")),
@@ -743,7 +1089,8 @@ func (k issueKeys) ShortHelp() []key.Binding {
 func (k issueKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.TabDesc, k.TabComments, k.TabLinks, k.TabTransitions},
-		{k.AssignMe, k.Unassign, k.EditSummary, k.EditDescription, k.OpenBrowser},
+		{k.AssignMe, k.AssignPick, k.Unassign, k.EditSummary, k.EditDescription, k.OpenBrowser},
+		{k.PickPriority, k.PickType, k.PickSprint, k.EditLabels, k.EditComponents},
 		{k.NewComment, k.EditComment, k.DeleteComment},
 		{k.Up, k.Down, k.Enter, k.Help, k.Back, k.Quit},
 	}

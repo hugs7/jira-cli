@@ -243,6 +243,209 @@ func (s *serverService) UpdateDescription(key, description string) error {
 	return s.client.putJSON("issue/"+key, body, nil)
 }
 
+// UpdatePriority sets the priority by name. Empty string clears the
+// field (sends `priority: null`).
+func (s *serverService) UpdatePriority(key, priority string) error {
+	var pv any
+	if priority == "" {
+		pv = nil
+	} else {
+		pv = map[string]string{"name": priority}
+	}
+	body := map[string]any{"fields": map[string]any{"priority": pv}}
+	return s.client.putJSON("issue/"+key, body, nil)
+}
+
+// UpdateIssueType changes the issue type by name. Some workflows
+// reject this if the new type lacks the current status — Jira will
+// return an error and we surface it verbatim.
+func (s *serverService) UpdateIssueType(key, typeName string) error {
+	if typeName == "" {
+		return fmt.Errorf("issue type cannot be empty")
+	}
+	body := map[string]any{
+		"fields": map[string]any{
+			"issuetype": map[string]string{"name": typeName},
+		},
+	}
+	return s.client.putJSON("issue/"+key, body, nil)
+}
+
+// UpdateLabels replaces the issue's full label set. Sending an empty
+// slice intentionally clears the field — Jira accepts `[]` here.
+func (s *serverService) UpdateLabels(key string, labels []string) error {
+	if labels == nil {
+		labels = []string{}
+	}
+	body := map[string]any{"fields": map[string]any{"labels": labels}}
+	return s.client.putJSON("issue/"+key, body, nil)
+}
+
+// UpdateComponents replaces the issue's component set by *name*
+// (Server resolves names to IDs server-side as long as they exist
+// in the project's component catalogue).
+func (s *serverService) UpdateComponents(key string, components []string) error {
+	objs := make([]map[string]string, 0, len(components))
+	for _, c := range components {
+		if c == "" {
+			continue
+		}
+		objs = append(objs, map[string]string{"name": c})
+	}
+	body := map[string]any{"fields": map[string]any{"components": objs}}
+	return s.client.putJSON("issue/"+key, body, nil)
+}
+
+// ListLabels hits Server's autocomplete endpoint. The result count is
+// hard-capped by the server (typically ~20) regardless of `limit`,
+// which is fine — the picker filters in-process anyway.
+func (s *serverService) ListLabels(prefix string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	endpoint := "jql/autocompletedata/suggestions" + queryString(map[string]string{
+		"fieldName":  "labels",
+		"fieldValue": prefix,
+	})
+	var raw struct {
+		Results []struct {
+			Value       string `json:"value"`
+			DisplayName string `json:"displayName"`
+		} `json:"results"`
+	}
+	if err := s.client.getJSON(endpoint, &raw); err != nil {
+		// Older servers don't expose this endpoint — return empty so
+		// the picker still works in pure free-text mode.
+		return []string{}, nil
+	}
+	out := make([]string, 0, len(raw.Results))
+	for _, r := range raw.Results {
+		v := r.Value
+		if v == "" {
+			v = r.DisplayName
+		}
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+// ListProjectComponents returns the component catalogue for a
+// project. Empty slice for projects that don't use components.
+func (s *serverService) ListProjectComponents(projectKey string) ([]NamedItem, error) {
+	if projectKey == "" {
+		return []NamedItem{}, nil
+	}
+	var raw []struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := s.client.getJSON("project/"+projectKey+"/components", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]NamedItem, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, NamedItem{ID: r.ID, Name: r.Name, Description: r.Description})
+	}
+	return out, nil
+}
+
+// MoveIssueToSprint uses the Agile API: PUT /sprint/{id}/issue to
+// add, POST /backlog/issue when sprintID == 0.
+func (s *serverService) MoveIssueToSprint(key string, sprintID int) error {
+	body := map[string]any{"issues": []string{key}}
+	if sprintID == 0 {
+		return s.client.postJSON(s.agileURL("backlog/issue"), body, nil)
+	}
+	return s.client.postJSON(s.agileURL(fmt.Sprintf("sprint/%d/issue", sprintID)), body, nil)
+}
+
+// ListPriorities returns the global priority catalogue.
+func (s *serverService) ListPriorities() ([]NamedItem, error) {
+	var raw []struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		IconURL     string `json:"iconUrl"`
+	}
+	if err := s.client.getJSON("priority", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]NamedItem, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, NamedItem{ID: r.ID, Name: r.Name, Description: r.Description, IconURL: r.IconURL})
+	}
+	return out, nil
+}
+
+// ListIssueTypes returns the issue types available for a project (or
+// the global set when projectKey is empty).
+func (s *serverService) ListIssueTypes(projectKey string) ([]NamedItem, error) {
+	if projectKey != "" {
+		var proj struct {
+			IssueTypes []struct {
+				ID          string `json:"id"`
+				Name        string `json:"name"`
+				Description string `json:"description"`
+				IconURL     string `json:"iconUrl"`
+				Subtask     bool   `json:"subtask"`
+			} `json:"issueTypes"`
+		}
+		if err := s.client.getJSON("project/"+projectKey, &proj); err == nil && len(proj.IssueTypes) > 0 {
+			out := make([]NamedItem, 0, len(proj.IssueTypes))
+			for _, t := range proj.IssueTypes {
+				out = append(out, NamedItem{
+					ID: t.ID, Name: t.Name, Description: t.Description, IconURL: t.IconURL,
+				})
+			}
+			return out, nil
+		}
+		// fall through to global catalogue if the project lookup failed
+	}
+	var raw []struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		IconURL     string `json:"iconUrl"`
+	}
+	if err := s.client.getJSON("issuetype", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]NamedItem, 0, len(raw))
+	for _, r := range raw {
+		out = append(out, NamedItem{ID: r.ID, Name: r.Name, Description: r.Description, IconURL: r.IconURL})
+	}
+	return out, nil
+}
+
+// ListProjectSprints walks every Scrum board for the project and
+// unions their sprint lists. Deduped by sprint ID. State defaults to
+// "active,future" — closed sprints are noisy in pickers.
+func (s *serverService) ListProjectSprints(projectKey, state string) ([]Sprint, error) {
+	if state == "" {
+		state = "active,future"
+	}
+	boards, err := s.ListBoards(projectKey, "scrum", 50)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[int]bool{}
+	var out []Sprint
+	for _, b := range boards {
+		sps, _ := s.ListBoardSprints(b.ID, state)
+		for _, sp := range sps {
+			if seen[sp.ID] {
+				continue
+			}
+			seen[sp.ID] = true
+			out = append(out, sp)
+		}
+	}
+	return out, nil
+}
+
 func (s *serverService) AssignIssue(key, name string) error {
 	// Server expects { "name": "<login>" } or { "name": null } to
 	// unassign. Accept the literal string "-1" as "automatic".
@@ -615,6 +818,46 @@ func (s *serverService) SearchUsers(query string, limit int) ([]User, error) {
 	var raw []srvUser
 	if err := s.client.getJSON(endpoint, &raw); err != nil {
 		return nil, err
+	}
+	out := make([]User, 0, len(raw))
+	for _, u := range raw {
+		out = append(out, User{
+			Name:        u.Name,
+			DisplayName: u.DisplayName,
+			Email:       u.EmailAddress,
+		})
+	}
+	return out, nil
+}
+
+// SearchAssignableUsers hits /user/assignable/search which returns
+// only users with permission to be assigned to the given issue. An
+// empty query is interpreted by Server as "all assignables" — handy
+// for showing a default candidate list when the picker first opens.
+func (s *serverService) SearchAssignableUsers(issueKey, query string, limit int) ([]User, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	params := map[string]string{
+		"username":   query,
+		"maxResults": itoa(limit),
+	}
+	if issueKey != "" {
+		params["issueKey"] = issueKey
+	}
+	// Server requires *one* of issueKey/project/projectKey/username
+	// to be non-empty. If we have neither an issue context nor a
+	// query, fall back to a wildcard so the API still returns
+	// something (most Server installs treat "." as match-all).
+	if issueKey == "" && query == "" {
+		params["username"] = "."
+	}
+	var raw []srvUser
+	if err := s.client.getJSON("user/assignable/search"+queryString(params), &raw); err != nil {
+		// Fall back to the generic user search if the assignable
+		// endpoint rejects us (e.g. the issue key wasn't accepted by
+		// this Server version).
+		return s.SearchUsers(query, limit)
 	}
 	out := make([]User, 0, len(raw))
 	for _, u := range raw {

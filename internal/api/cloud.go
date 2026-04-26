@@ -59,6 +59,20 @@ func (c *cloudService) SearchIssues(in SearchInput) ([]Issue, error)      { retu
 func (c *cloudService) UpdateSummary(key, summary string) error           { return errCloudTodo }
 func (c *cloudService) UpdateDescription(key, description string) error   { return errCloudTodo }
 func (c *cloudService) AssignIssue(key, accountID string) error           { return errCloudTodo }
+func (c *cloudService) UpdatePriority(key, priority string) error           { return errCloudTodo }
+func (c *cloudService) UpdateIssueType(key, t string) error                 { return errCloudTodo }
+func (c *cloudService) MoveIssueToSprint(key string, sprintID int) error    { return errCloudTodo }
+func (c *cloudService) UpdateLabels(key string, labels []string) error      { return errCloudTodo }
+func (c *cloudService) UpdateComponents(key string, comps []string) error   { return errCloudTodo }
+func (c *cloudService) ListPriorities() ([]NamedItem, error)                { return nil, errCloudTodo }
+func (c *cloudService) ListIssueTypes(p string) ([]NamedItem, error)        { return nil, errCloudTodo }
+func (c *cloudService) ListLabels(prefix string, limit int) ([]string, error) {
+	return []string{}, nil
+}
+func (c *cloudService) ListProjectComponents(p string) ([]NamedItem, error) {
+	return []NamedItem{}, nil
+}
+func (c *cloudService) ListProjectSprints(p, st string) ([]Sprint, error) { return []Sprint{}, nil }
 func (c *cloudService) ListComments(key string) ([]Comment, error)        { return nil, errCloudTodo }
 func (c *cloudService) AddComment(key, body string) (*Comment, error)     { return nil, errCloudTodo }
 func (c *cloudService) EditComment(key, id, body string) (*Comment, error) {
@@ -76,6 +90,9 @@ func (c *cloudService) ListMentioned(max int) ([]Issue, error)       { return []
 func (c *cloudService) ListWatching(max int) ([]Issue, error)        { return []Issue{}, nil }
 func (c *cloudService) ListCurrentSprint(max int) ([]Issue, error)   { return []Issue{}, nil }
 func (c *cloudService) SearchUsers(q string, lim int) ([]User, error) {
+	return nil, errCloudTodo
+}
+func (c *cloudService) SearchAssignableUsers(issueKey, q string, lim int) ([]User, error) {
 	return nil, errCloudTodo
 }
 

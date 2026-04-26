@@ -31,6 +31,40 @@ type Service interface {
 	UpdateDescription(key, description string) error
 	AssignIssue(key, accountIDOrName string) error
 
+	// Field setters used by the picker overlays. Empty string clears
+	// the field (Jira API shape varies — implementations translate).
+	UpdatePriority(key, priority string) error
+	UpdateIssueType(key, typeName string) error
+
+	// MoveIssueToSprint puts the issue into the given sprint
+	// (sprintID > 0) or back onto the project backlog (sprintID == 0).
+	MoveIssueToSprint(key string, sprintID int) error
+
+	// UpdateLabels replaces the issue's full label set. Empty slice
+	// clears all labels. Labels are free-text on Jira so values are
+	// not validated against any catalogue.
+	UpdateLabels(key string, labels []string) error
+
+	// UpdateComponents replaces the issue's component set with the
+	// given component names (which must exist in the project).
+	UpdateComponents(key string, components []string) error
+
+	// Catalogue endpoints used to populate static pickers.
+	ListPriorities() ([]NamedItem, error)
+	ListIssueTypes(projectKey string) ([]NamedItem, error)
+	// ListLabels returns the labels in use across the instance,
+	// matching the optional `prefix` query so the picker can
+	// autocomplete. Best-effort — Server returns nothing on older
+	// versions and falls back to "free text only".
+	ListLabels(prefix string, limit int) ([]string, error)
+	// ListProjectComponents returns the component catalogue defined
+	// for the given project. Empty slice if components aren't used.
+	ListProjectComponents(projectKey string) ([]NamedItem, error)
+	// ListProjectSprints returns active+future sprints across every
+	// board associated with the project (deduped). Empty state =>
+	// "active,future". Used for the sprint picker.
+	ListProjectSprints(projectKey, state string) ([]Sprint, error)
+
 	ListComments(key string) ([]Comment, error)
 	AddComment(key, body string) (*Comment, error)
 	EditComment(key, commentID, body string) (*Comment, error)
@@ -49,6 +83,11 @@ type Service interface {
 	ListCurrentSprint(maxResults int) ([]Issue, error)
 
 	SearchUsers(query string, limit int) ([]User, error)
+
+	// SearchAssignableUsers returns users who can be assigned to the
+	// given issue. Empty issueKey falls back to a project-scoped or
+	// global search. Used by the interactive assignee picker.
+	SearchAssignableUsers(issueKey, query string, limit int) ([]User, error)
 
 	// --- Agile / Boards ---
 	//
