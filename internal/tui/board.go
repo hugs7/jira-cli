@@ -64,6 +64,7 @@ type boardModel struct {
 
 	loading int // count of in-flight loads
 	err     error
+	status  string // transient one-line feedback for the help row
 	spinner spinner.Model
 	help    help.Model
 	keys    boardKeys
@@ -111,6 +112,14 @@ type boardSprintsMsg struct {
 	err     error
 }
 
+// cardMovedMsg is the result of a drag (H/L). label describes the
+// attempted move ("FOO-1 → In Progress") and is shown in the
+// status row regardless of outcome.
+type cardMovedMsg struct {
+	label string
+	err   error
+}
+
 func (m *boardModel) fetchConfig() tea.Cmd {
 	id := m.boardID
 	svc := m.svc
@@ -135,6 +144,62 @@ func (m *boardModel) fetchIssues() tea.Cmd {
 	return func() tea.Msg {
 		issues, err := svc.ListBoardIssues(id, sp, "", 200)
 		return boardIssuesMsg{issues: issues, err: err}
+	}
+}
+
+// moveCardCmd transitions the focused card into a status that maps
+// to the column `dir` away from the current one (-1 = left, +1 =
+// right). It looks up the available transitions for the issue and
+// picks the first one whose destination status sits in the target
+// column's status set; columns that have no usable transition leave
+// a status message rather than failing silently.
+func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
+	if m.cfg == nil {
+		return nil
+	}
+	iss, ok := m.cardAtCursor()
+	if !ok {
+		return nil
+	}
+	target := m.colCursor + dir
+	if target < 0 || target >= len(m.cfg.Columns) {
+		m.status = "edge column — can't move further"
+		return nil
+	}
+	col := m.cfg.Columns[target]
+	if len(col.StatusKeys) == 0 {
+		m.status = fmt.Sprintf("column %q has no statuses mapped", col.Name)
+		return nil
+	}
+	svc := m.svc
+	key := iss.Key
+	colName := col.Name
+	wanted := map[string]bool{}
+	for _, k := range col.StatusKeys {
+		wanted[strings.ToLower(k)] = true
+	}
+	label := fmt.Sprintf("%s → %s", key, colName)
+	m.loading++
+	return func() tea.Msg {
+		ts, err := svc.ListTransitions(key)
+		if err != nil {
+			return cardMovedMsg{label: label, err: err}
+		}
+		var pickID string
+		for _, t := range ts {
+			if wanted[strings.ToLower(t.To)] {
+				pickID = t.ID
+				break
+			}
+		}
+		if pickID == "" {
+			return cardMovedMsg{label: label,
+				err: fmt.Errorf("no transition into column %q is available", colName)}
+		}
+		if err := svc.DoTransition(key, pickID); err != nil {
+			return cardMovedMsg{label: label, err: err}
+		}
+		return cardMovedMsg{label: label}
 	}
 }
 
@@ -195,6 +260,23 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.layout()
 		return m, nil
+
+	case cardMovedMsg:
+		if m.loading > 0 {
+			m.loading--
+		}
+		if msg.err != nil {
+			m.status = "✗ " + msg.label + ": " + msg.err.Error()
+			m.layout()
+			m.composeBody()
+			return m, nil
+		}
+		m.status = "✓ " + msg.label
+		m.layout()
+		// The card has changed status; refetch the board so the
+		// regroup picks up the new column placement.
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
 
 	case boardIssuesMsg:
 		m.issues = msg.issues
@@ -294,6 +376,16 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.layout()
 			m.composeBody()
 			m.snapVP()
+		case key.Matches(msg, m.keys.MoveLeft):
+			if cmd := m.moveCardCmd(-1); cmd != nil {
+				return m, tea.Batch(m.spinner.Tick, cmd)
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.MoveRight):
+			if cmd := m.moveCardCmd(1); cmd != nil {
+				return m, tea.Batch(m.spinner.Tick, cmd)
+			}
+			return m, nil
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
 			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
@@ -558,8 +650,27 @@ func (m boardModel) View() string {
 	header := m.renderTitleBar()
 
 	// --- footer ---
-	help := m.help.View(m.keys)
-	return strings.Join([]string{header, "", m.headerRow, m.vp.View(), help + m.boardScrollHint()}, "\n")
+	return strings.Join([]string{header, "", m.headerRow, m.vp.View(), m.renderFooter()}, "\n")
+}
+
+// renderFooter composes the status + help row. Used both by View
+// and by layout (so chrome-height measurement accounts for the
+// status row's potential wrap on narrow terminals).
+func (m *boardModel) renderFooter() string {
+	footer := m.help.View(m.keys) + m.boardScrollHint()
+	if m.status == "" {
+		return footer
+	}
+	var st string
+	switch {
+	case strings.HasPrefix(m.status, "✗"):
+		st = statusErr.Render(m.status)
+	case strings.HasPrefix(m.status, "✓"):
+		st = statusOK.Render(m.status)
+	default:
+		st = statusInfo.Render(m.status)
+	}
+	return st + "  " + titleSep + "  " + footer
 }
 
 // layout sizes the body viewport. The chrome height is *measured*
@@ -583,7 +694,7 @@ func (m *boardModel) layout() {
 	// if it didn't — pushing the bottom card off-screen and making
 	// G look like it doesn't scroll quite far enough.
 	titleH := visualHeight(m.renderTitleBar(), m.width)
-	helpH := visualHeight(m.help.View(m.keys)+m.boardScrollHint(), m.width)
+	helpH := visualHeight(m.renderFooter(), m.width)
 	// Layout: title (titleH) + blank (1) + sticky col header (1) +
 	// vp (h) + footer (helpH).  Joined by 4 \n separators which add
 	// no extra physical lines beyond what each block contributes.
@@ -901,6 +1012,7 @@ type boardKeys struct {
 	PageDown, PageUp             key.Binding // Ctrl-f / Ctrl-b
 	Top, Bottom                  key.Binding
 	FirstCol, LastCol            key.Binding // 0 / $
+	MoveLeft, MoveRight          key.Binding // H / L — drag card
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
 	Help, Quit                   key.Binding
@@ -918,8 +1030,10 @@ func defaultBoardKeys() boardKeys {
 		PageUp:   key.NewBinding(key.WithKeys("ctrl+b", "pgup"), key.WithHelp("⌃b", "page up")),
 		Top:      key.NewBinding(key.WithKeys("g", "home"), key.WithHelp("g/gg", "top")),
 		Bottom:   key.NewBinding(key.WithKeys("G", "end"), key.WithHelp("G", "bottom")),
-		FirstCol: key.NewBinding(key.WithKeys("0", "^"), key.WithHelp("0", "first column")),
-		LastCol:  key.NewBinding(key.WithKeys("$"), key.WithHelp("$", "last column")),
+		FirstCol:  key.NewBinding(key.WithKeys("0", "^"), key.WithHelp("0", "first column")),
+		LastCol:   key.NewBinding(key.WithKeys("$"), key.WithHelp("$", "last column")),
+		MoveLeft:  key.NewBinding(key.WithKeys("H"), key.WithHelp("H", "drag card left")),
+		MoveRight: key.NewBinding(key.WithKeys("L"), key.WithHelp("L", "drag card right")),
 		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
@@ -936,6 +1050,7 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom, k.FirstCol, k.LastCol},
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
+		{k.MoveLeft, k.MoveRight},
 		{k.Sprint, k.Refresh, k.Help, k.Quit},
 	}
 }
