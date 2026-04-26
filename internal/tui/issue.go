@@ -222,6 +222,11 @@ func (m issueModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.spinner.Tick, m.runAction("description updated", "issue", func() error {
 				return m.svc.UpdateDescription(m.key, body)
 			}))
+		case "edit-summary":
+			m.loading++
+			return m, tea.Batch(m.spinner.Tick, m.runAction("summary updated", "issue", func() error {
+				return m.svc.UpdateSummary(m.key, body)
+			}))
 		case "add-comment":
 			m.loading++
 			return m, tea.Batch(m.spinner.Tick, m.runAction("comment added", "comments", func() error {
@@ -309,6 +314,27 @@ func (m issueModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			desc = m.issue.Description
 		}
 		return m, m.editorCmd("edit-description", "", desc)
+	case key.Matches(msg, m.keys.EditSummary):
+		summary := ""
+		if m.issue != nil {
+			summary = m.issue.Summary
+		}
+		return m, m.editorCmd("edit-summary", "", summary)
+	case key.Matches(msg, m.keys.AssignMe):
+		me := m.svc.Me()
+		if me == "" {
+			m.status = "✗ no `me` configured for this host"
+			return m, nil
+		}
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction("assigned to "+me, "issue", func() error {
+			return m.svc.AssignIssue(m.key, me)
+		}))
+	case key.Matches(msg, m.keys.Unassign):
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction("unassigned", "issue", func() error {
+			return m.svc.AssignIssue(m.key, "")
+		}))
 	}
 
 	// Per-mode keys.
@@ -677,8 +703,9 @@ type issueKeys struct {
 
 	TabDesc, TabComments, TabLinks, TabTransitions key.Binding
 
-	OpenBrowser, EditDescription, NewComment        key.Binding
-	EditComment, DeleteComment, ConfirmYes, ConfirmNo key.Binding
+	OpenBrowser, EditDescription, EditSummary, NewComment key.Binding
+	AssignMe, Unassign                                    key.Binding
+	EditComment, DeleteComment, ConfirmYes, ConfirmNo     key.Binding
 }
 
 func defaultIssueKeys() issueKeys {
@@ -697,6 +724,9 @@ func defaultIssueKeys() issueKeys {
 
 		OpenBrowser:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		EditDescription: key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit desc")),
+		EditSummary:     key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "edit summary")),
+		AssignMe:        key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "assign me")),
+		Unassign:        key.NewBinding(key.WithKeys("U"), key.WithHelp("U", "unassign")),
 		NewComment:      key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new comment")),
 		EditComment:     key.NewBinding(key.WithKeys("E"), key.WithHelp("E", "edit comment")),
 		DeleteComment:   key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete comment")),
@@ -707,13 +737,14 @@ func defaultIssueKeys() issueKeys {
 
 func (k issueKeys) ShortHelp() []key.Binding {
 	return []key.Binding{
-		k.TabDesc, k.TabComments, k.TabTransitions, k.NewComment, k.EditDescription, k.OpenBrowser, k.Back, k.Quit,
+		k.TabDesc, k.TabComments, k.TabTransitions, k.AssignMe, k.EditSummary, k.EditDescription, k.NewComment, k.OpenBrowser, k.Back, k.Quit,
 	}
 }
 func (k issueKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.TabDesc, k.TabComments, k.TabLinks, k.TabTransitions},
-		{k.NewComment, k.EditComment, k.DeleteComment, k.EditDescription, k.OpenBrowser},
+		{k.AssignMe, k.Unassign, k.EditSummary, k.EditDescription, k.OpenBrowser},
+		{k.NewComment, k.EditComment, k.DeleteComment},
 		{k.Up, k.Down, k.Enter, k.Help, k.Back, k.Quit},
 	}
 }
