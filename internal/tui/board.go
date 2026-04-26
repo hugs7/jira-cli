@@ -424,11 +424,38 @@ var (
 			Background(lipgloss.Color("57")).Padding(0, 2)
 	colHeaderDim = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("245")).
 			Padding(0, 2)
-	cardBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("238")).Padding(0, 1).Margin(0, 0, 1, 0)
-	cardSel = lipgloss.NewStyle().Border(lipgloss.ThickBorder()).
-			BorderForeground(lipgloss.Color("11")).Padding(0, 1).Margin(0, 0, 1, 0)
+	cardBase = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
+			Padding(0, 1).Margin(0, 0, 1, 0)
+	cardSelBase = lipgloss.NewStyle().Border(lipgloss.ThickBorder()).
+			Padding(0, 1).Margin(0, 0, 1, 0)
+	emptyColPlaceholder = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Italic(true)
 )
+
+// issueTypeColor maps a Jira issue-type string to the colour used on
+// the card border and key chip. Lookup is case-insensitive against
+// the type name; common Jira / agile defaults are covered, with a
+// muted grey fallback.
+func issueTypeColor(typeName string) lipgloss.Color {
+	switch strings.ToLower(typeName) {
+	case "story":
+		return lipgloss.Color("46") // bright green
+	case "bug", "defect":
+		return lipgloss.Color("196") // red
+	case "epic":
+		return lipgloss.Color("141") // purple
+	case "task":
+		return lipgloss.Color("39") // blue
+	case "sub-task", "subtask":
+		return lipgloss.Color("51") // cyan
+	case "improvement":
+		return lipgloss.Color("220") // yellow
+	case "spike":
+		return lipgloss.Color("208") // orange
+	case "incident", "outage":
+		return lipgloss.Color("197") // pink-red
+	}
+	return lipgloss.Color("245") // muted grey
+}
 
 func (m boardModel) View() string {
 	if m.err != nil {
@@ -576,8 +603,15 @@ func (m *boardModel) renderColumnHeader(idx, width int) string {
 }
 
 // renderColumnCards returns the cards for a column, no header. The
-// header is sticky above the viewport.
+// header is sticky above the viewport. Empty columns get a width-
+// padded placeholder block so JoinHorizontal still allocates the
+// right horizontal slot — without this, an empty column collapses
+// to zero width and shifts every column to its right out of
+// alignment with the sticky headers.
 func (m *boardModel) renderColumnCards(idx, width int) string {
+	if len(m.grouped[idx]) == 0 {
+		return emptyColPlaceholder.Width(width).Render("  (empty)")
+	}
 	var b strings.Builder
 	for ri, iss := range m.grouped[idx] {
 		selected := idx == m.colCursor && ri == m.rowCursor
@@ -587,9 +621,11 @@ func (m *boardModel) renderColumnCards(idx, width int) string {
 }
 
 func renderBoardCard(iss api.Issue, width int, selected bool) string {
-	keyLine := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("12")).Render(iss.Key)
+	typeCol := issueTypeColor(iss.IssueType)
+	keyStyle := lipgloss.NewStyle().Bold(true).Foreground(typeCol)
+	keyLine := keyStyle.Render(iss.Key)
 	if iss.IssueType != "" {
-		keyLine += " " + paneMutedStyle.Render("· "+iss.IssueType)
+		keyLine += " " + lipgloss.NewStyle().Foreground(typeCol).Render("· "+iss.IssueType)
 	}
 	maxSum := width - 4
 	if maxSum < 8 {
@@ -610,9 +646,11 @@ func renderBoardCard(iss api.Issue, width int, selected bool) string {
 
 	body := keyLine + "\n" + summary + "\n" + metaLine
 
-	style := cardBorder
+	style := cardBase.BorderForeground(typeCol)
 	if selected {
-		style = cardSel
+		// Brighter, thick border in the issue type's accent colour
+		// so selection still pops without losing the type cue.
+		style = cardSelBase.BorderForeground(lipgloss.Color("11"))
 	}
 	return style.Width(width - 2).Render(body)
 }
