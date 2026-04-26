@@ -1,0 +1,22 @@
+# Binaries
+/jr
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+
+# Editor
+.idea/
+.vscode/
+.VSCodeCounter/
+*.swp
+
+# OS
+.DS_Store
+
+# Local config / secrets
+*.local.yml
+.env
