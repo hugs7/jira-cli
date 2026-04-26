@@ -399,6 +399,191 @@ func (s *serverService) ListCurrentSprint(max int) ([]Issue, error) {
 	return issues, nil
 }
 
+// --- agile / boards (REST /rest/agile/1.0) ---
+
+// agileURL builds an absolute URL into the Jira Agile namespace,
+// which lives next to /rest/api/2 under the same host root.
+func (s *serverService) agileURL(path string) string {
+	return s.client.HostRoot() + "/rest/agile/1.0/" + strings.TrimLeft(path, "/")
+}
+
+type srvBoard struct {
+	ID       int    `json:"id"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Location struct {
+		ProjectKey  string `json:"projectKey"`
+		ProjectName string `json:"projectName"`
+	} `json:"location"`
+}
+
+type srvBoardPage struct {
+	Values     []srvBoard `json:"values"`
+	IsLast     bool       `json:"isLast"`
+	StartAt    int        `json:"startAt"`
+	MaxResults int        `json:"maxResults"`
+	Total      int        `json:"total"`
+}
+
+func (s *serverService) ListBoards(projectKey, kind string, max int) ([]Board, error) {
+	if max <= 0 {
+		max = 50
+	}
+	params := map[string]string{"maxResults": itoa(max)}
+	if projectKey != "" {
+		params["projectKeyOrId"] = projectKey
+	}
+	if kind != "" {
+		params["type"] = strings.ToLower(kind)
+	}
+	var page srvBoardPage
+	if err := s.client.getJSON(s.agileURL("board")+queryString(params), &page); err != nil {
+		// 404 → addon isn't installed; swallow that one. Surface
+		// every other failure (auth, transport, server bugs).
+		if strings.HasPrefix(err.Error(), "HTTP 404") {
+			return []Board{}, nil
+		}
+		return nil, err
+	}
+	out := make([]Board, 0, len(page.Values))
+	for _, b := range page.Values {
+		out = append(out, Board{
+			ID:         b.ID,
+			Name:       b.Name,
+			Type:       b.Type,
+			ProjectKey: b.Location.ProjectKey,
+		})
+	}
+	return out, nil
+}
+
+type srvBoardConfig struct {
+	ID           int    `json:"id"`
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	Location     struct {
+		ProjectKey string `json:"projectKey"`
+	} `json:"location"`
+	ColumnConfig struct {
+		Columns []struct {
+			Name     string `json:"name"`
+			Statuses []struct {
+				ID string `json:"id"`
+			} `json:"statuses"`
+		} `json:"columns"`
+	} `json:"columnConfig"`
+}
+
+func (s *serverService) GetBoardConfig(boardID int) (*BoardConfig, error) {
+	var raw srvBoardConfig
+	endpoint := s.agileURL(fmt.Sprintf("board/%d/configuration", boardID))
+	if err := s.client.getJSON(endpoint, &raw); err != nil {
+		return nil, err
+	}
+
+	// We need status names (not just IDs) so we can match issues by
+	// their human status string. Resolve the IDs in one hop.
+	idToName, _ := s.statusIDLookup()
+
+	out := BoardConfig{Board: Board{
+		ID:         raw.ID,
+		Name:       raw.Name,
+		Type:       raw.Type,
+		ProjectKey: raw.Location.ProjectKey,
+	}}
+	for _, c := range raw.ColumnConfig.Columns {
+		col := BoardColumn{Name: c.Name}
+		for _, st := range c.Statuses {
+			col.StatusIDs = append(col.StatusIDs, st.ID)
+			if name, ok := idToName[st.ID]; ok {
+				col.StatusKeys = append(col.StatusKeys, strings.ToLower(name))
+			}
+		}
+		out.Columns = append(out.Columns, col)
+	}
+	return &out, nil
+}
+
+// statusIDLookup fetches every status definition on the instance and
+// returns an id→name map. Cached implicitly per call (cheap, the
+// payload is a few KB).
+func (s *serverService) statusIDLookup() (map[string]string, error) {
+	var raw []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	if err := s.client.getJSON("status", &raw); err != nil {
+		return map[string]string{}, err
+	}
+	out := make(map[string]string, len(raw))
+	for _, r := range raw {
+		out[r.ID] = r.Name
+	}
+	return out, nil
+}
+
+type srvSprint struct {
+	ID    int    `json:"id"`
+	Name  string `json:"name"`
+	State string `json:"state"`
+}
+
+type srvSprintPage struct {
+	Values []srvSprint `json:"values"`
+	IsLast bool        `json:"isLast"`
+}
+
+func (s *serverService) ListBoardSprints(boardID int, state string) ([]Sprint, error) {
+	params := map[string]string{}
+	if state != "" {
+		params["state"] = state
+	}
+	endpoint := s.agileURL(fmt.Sprintf("board/%d/sprint", boardID)) + queryString(params)
+	var page srvSprintPage
+	if err := s.client.getJSON(endpoint, &page); err != nil {
+		// Kanban boards (and addon-less hosts) return 4xx for sprint
+		// queries — that's expected, not an error worth surfacing.
+		if strings.HasPrefix(err.Error(), "HTTP 4") {
+			return []Sprint{}, nil
+		}
+		return nil, err
+	}
+	out := make([]Sprint, 0, len(page.Values))
+	for _, sp := range page.Values {
+		out = append(out, Sprint{ID: sp.ID, Name: sp.Name, State: sp.State})
+	}
+	return out, nil
+}
+
+func (s *serverService) ListBoardIssues(boardID, sprintID int, jqlFilter string, max int) ([]Issue, error) {
+	if max <= 0 {
+		max = 100
+	}
+	// Choose the most precise endpoint: sprint scope is tighter than
+	// board scope, and avoids pulling backlog noise into the view.
+	var endpoint string
+	if sprintID > 0 {
+		endpoint = s.agileURL(fmt.Sprintf("board/%d/sprint/%d/issue", boardID, sprintID))
+	} else {
+		endpoint = s.agileURL(fmt.Sprintf("board/%d/issue", boardID))
+	}
+	params := map[string]string{"maxResults": itoa(max)}
+	if jqlFilter != "" {
+		params["jql"] = jqlFilter
+	}
+	endpoint += queryString(params)
+
+	var resp srvSearchResp
+	if err := s.client.getJSON(endpoint, &resp); err != nil {
+		return nil, err
+	}
+	out := make([]Issue, 0, len(resp.Issues))
+	for _, i := range resp.Issues {
+		out = append(out, s.toIssue(i))
+	}
+	return out, nil
+}
+
 func (s *serverService) SearchUsers(query string, limit int) ([]User, error) {
 	if limit <= 0 {
 		limit = 20

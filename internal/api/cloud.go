@@ -78,3 +78,14 @@ func (c *cloudService) ListCurrentSprint(max int) ([]Issue, error)   { return []
 func (c *cloudService) SearchUsers(q string, lim int) ([]User, error) {
 	return nil, errCloudTodo
 }
+
+func (c *cloudService) ListBoards(projectKey, kind string, max int) ([]Board, error) {
+	return []Board{}, nil
+}
+func (c *cloudService) GetBoardConfig(boardID int) (*BoardConfig, error) { return nil, errCloudTodo }
+func (c *cloudService) ListBoardSprints(boardID int, state string) ([]Sprint, error) {
+	return []Sprint{}, nil
+}
+func (c *cloudService) ListBoardIssues(boardID, sprintID int, jql string, max int) ([]Issue, error) {
+	return []Issue{}, nil
+}

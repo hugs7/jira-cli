@@ -77,3 +77,33 @@ type SearchInput struct {
 	JQL        string
 	MaxResults int
 }
+
+// Board is one Jira Software / Agile board (Scrum or Kanban).
+type Board struct {
+	ID         int
+	Name       string
+	Type       string // "scrum" | "kanban" | "simple"
+	ProjectKey string
+}
+
+// BoardColumn is one swim column on a board, mapped to a list of
+// Jira statuses. The column count plus the status set drive the
+// Kanban TUI layout.
+type BoardColumn struct {
+	Name       string
+	StatusIDs  []string
+	StatusKeys []string // status names (lowercased) for case-insensitive matching
+}
+
+// BoardConfig couples a Board with its column layout.
+type BoardConfig struct {
+	Board   Board
+	Columns []BoardColumn
+}
+
+// Sprint is one iteration on a Scrum board.
+type Sprint struct {
+	ID    int
+	Name  string
+	State string // "active" | "future" | "closed"
+}

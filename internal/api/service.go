@@ -49,6 +49,18 @@ type Service interface {
 	ListCurrentSprint(maxResults int) ([]Issue, error)
 
 	SearchUsers(query string, limit int) ([]User, error)
+
+	// --- Agile / Boards ---
+	//
+	// Boards live under a sibling REST namespace (/rest/agile/1.0)
+	// and may not be enabled on every instance — implementations
+	// return ([]Board{}, nil) when the addon isn't installed rather
+	// than blowing up.
+
+	ListBoards(projectKey, kind string, max int) ([]Board, error)
+	GetBoardConfig(boardID int) (*BoardConfig, error)
+	ListBoardSprints(boardID int, state string) ([]Sprint, error)
+	ListBoardIssues(boardID int, sprintID int, jqlFilter string, max int) ([]Issue, error)
 }
 
 // NewService picks the right implementation for a configured host.
