@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -36,6 +37,7 @@ const (
 	modeDescription issueMode = iota
 	modeComments
 	modeLinks
+	modeAttachments
 	modeConfirmDelete
 	modeTransitions
 	modePicker // generic picker overlay (assignee, priority, …)
@@ -56,9 +58,11 @@ type issueModel struct {
 	commentsVP  viewport.Model
 	linksVP     viewport.Model
 	transVP     viewport.Model
+	attachVP    viewport.Model
 	commentsCur int
 	transCur    int
 	linksCur    int
+	attachCur   int
 
 	pendingDeleteID string
 
@@ -95,6 +99,7 @@ func newIssueModel(svc api.Service, key string) issueModel {
 		commentsVP: viewport.New(0, 0),
 		linksVP:    viewport.New(0, 0),
 		transVP:    viewport.New(0, 0),
+		attachVP:   viewport.New(0, 0),
 		spinner:    sp,
 		help:       help.New(),
 		keys:       defaultIssueKeys(),
@@ -365,9 +370,20 @@ func (m issueModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.spinner.Tick, m.fetchLinks())
 		}
 		return m, nil
+	case key.Matches(msg, m.keys.TabAttachments):
+		m.mode = modeAttachments
+		// Loaded Issue already carries Attachments; just clamp the
+		// cursor in case a previous fetch trimmed the list.
+		if m.issue != nil && m.attachCur >= len(m.issue.Attachments) {
+			m.attachCur = 0
+		}
+		m.refreshContent()
+		return m, nil
 	case key.Matches(msg, m.keys.TabTransitions):
 		m.mode = modeTransitions
 		return m, nil
+	case key.Matches(msg, m.keys.UploadAttachment):
+		return m, m.openUploadAttachmentPicker()
 	case key.Matches(msg, m.keys.OpenBrowser):
 		if m.issue != nil && m.issue.WebURL != "" {
 			_ = openInBrowser(m.issue.WebURL)
@@ -493,6 +509,45 @@ func (m issueModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.linksVP, cmd = m.linksVP.Update(msg)
+		return m, cmd
+
+	case modeAttachments:
+		count := 0
+		if m.issue != nil {
+			count = len(m.issue.Attachments)
+		}
+		switch {
+		case key.Matches(msg, m.keys.Up):
+			if m.attachCur > 0 {
+				m.attachCur--
+				m.refreshContent()
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.Down):
+			if m.attachCur < count-1 {
+				m.attachCur++
+				m.refreshContent()
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.Enter):
+			if a, ok := m.attachmentAtCursor(); ok && a.BrowseURL != "" {
+				_ = openInBrowser(a.BrowseURL)
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.DeleteAttachment):
+			if a, ok := m.attachmentAtCursor(); ok {
+				id := a.ID
+				name := a.Filename
+				m.loading++
+				return m, tea.Batch(m.spinner.Tick, m.runAction(
+					"deleted "+name, "issue", func() error {
+						return m.svc.DeleteAttachment(id)
+					}))
+			}
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.attachVP, cmd = m.attachVP.Update(msg)
 		return m, cmd
 
 	case modeTransitions:
@@ -631,6 +686,7 @@ func (m *issueModel) layout() {
 	m.commentsVP.Width, m.commentsVP.Height = w, bodyH
 	m.linksVP.Width, m.linksVP.Height = w, bodyH
 	m.transVP.Width, m.transVP.Height = w, bodyH
+	m.attachVP.Width, m.attachVP.Height = w, bodyH
 }
 
 // refreshContent re-renders whichever viewport the current mode uses.
@@ -645,6 +701,7 @@ func (m *issueModel) refreshContent() {
 	m.commentsVP.SetContent(m.renderComments())
 	m.linksVP.SetContent(m.renderLinks())
 	m.transVP.SetContent(m.renderTransitions())
+	m.attachVP.SetContent(m.renderAttachments())
 }
 
 func (m issueModel) View() string {
@@ -669,6 +726,8 @@ func (m issueModel) View() string {
 		body = m.commentsVP.View()
 	case modeLinks:
 		body = m.linksVP.View()
+	case modeAttachments:
+		body = m.attachVP.View()
 	case modeTransitions:
 		body = m.transVP.View()
 	case modeConfirmDelete:
@@ -743,10 +802,15 @@ func (m issueModel) renderTabs() string {
 		}
 		return s.Render(label)
 	}
+	attachCount := 0
+	if m.issue != nil {
+		attachCount = len(m.issue.Attachments)
+	}
 	parts := []string{
 		tab("[d] description", true, m.mode == modeDescription),
 		tab(fmt.Sprintf("[c] comments (%d)", len(m.comments)), true, m.mode == modeComments),
 		tab(fmt.Sprintf("[l] links"), true, m.mode == modeLinks),
+		tab(fmt.Sprintf("[f] files (%d)", attachCount), true, m.mode == modeAttachments),
 		tab(fmt.Sprintf("[t] transitions (%d)", len(m.transitions)), true, m.mode == modeTransitions),
 	}
 	return strings.Join(parts, " ")
@@ -808,6 +872,54 @@ func (m *issueModel) linkAtCursor() (api.IssueLink, bool) {
 		return api.IssueLink{}, false
 	}
 	return m.links[m.linksCur], true
+}
+
+// renderAttachments lists the files attached to the issue, with the
+// cursor row highlighted. Empty state advertises the upload key so
+// the feature is discoverable without the help overlay.
+func (m issueModel) renderAttachments() string {
+	if m.issue == nil {
+		return paneMutedStyle.Render("loading…")
+	}
+	if len(m.issue.Attachments) == 0 {
+		return paneMutedStyle.Render("(no attachments — press F to upload one)")
+	}
+	var b strings.Builder
+	for i, a := range m.issue.Attachments {
+		marker := "  "
+		if i == m.attachCur {
+			marker = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true).Render("▶ ")
+		}
+		name := lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Render(a.Filename)
+		size := paneMutedStyle.Render(humanBytes(a.Size))
+		meta := paneMutedStyle.Render(fmt.Sprintf("by %s · %s", a.Author, a.CreatedAt.Local().Format("2006-01-02 15:04")))
+		b.WriteString(fmt.Sprintf("%s%s  %s  %s\n", marker, name, size, meta))
+	}
+	return b.String()
+}
+
+// attachmentAtCursor returns the Attachment under the modeAttachments
+// cursor if in range.
+func (m *issueModel) attachmentAtCursor() (api.Attachment, bool) {
+	if m.issue == nil || m.attachCur < 0 || m.attachCur >= len(m.issue.Attachments) {
+		return api.Attachment{}, false
+	}
+	return m.issue.Attachments[m.attachCur], true
+}
+
+// humanBytes renders a byte count in the smallest unit that yields a
+// number under 1024 (e.g. "12.4 MB").
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for x := n / unit; x >= unit; x /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func (m issueModel) renderTransitions() string {
@@ -1328,6 +1440,24 @@ func (m *issueModel) showWatchersPicker(current []api.User) tea.Cmd {
 	return p.Init()
 }
 
+// openUploadAttachmentPicker opens a free-text picker the user can
+// type a file path into. Submitting "" cancels (free-text picker
+// returns empty Value on Enter with no input).
+func (m *issueModel) openUploadAttachmentPicker() tea.Cmd {
+	loader := func(query string, token int) tea.Cmd {
+		return func() tea.Msg {
+			return pickerLoadedMsg{Token: token}
+		}
+	}
+	p := NewAsyncPicker("attachfile", "Upload to "+m.key, "/path/to/file…", loader)
+	p.SetSize(m.width, m.height)
+	p.EnableFreeText()
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
 // toggleWatchCmd flips the current user's watch state on this
 // issue. Reloads the issue afterwards so the eye chip updates.
 func (m *issueModel) toggleWatchCmd() tea.Cmd {
@@ -1463,6 +1593,32 @@ func (m *issueModel) applyPicker(msg pickerDoneMsg) (tea.Model, tea.Cmd) {
 			fmt.Sprintf("story points → %g", points), "issue", func() error {
 				return m.svc.UpdateStoryPoints(m.key, points)
 			}))
+	case "attachfile":
+		path, _ := msg.Value.(string)
+		path = strings.TrimSpace(path)
+		// Expand a leading ~ so users can paste paths copied from
+		// their shell history without surprise.
+		if strings.HasPrefix(path, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				path = home + path[1:]
+			}
+		}
+		if path == "" {
+			m.status = "✗ no file path entered"
+			return m, nil
+		}
+		key := m.key
+		svc := m.svc
+		// Switch to the attachments tab so the user sees the new
+		// file appear once the post-upload reload lands.
+		m.mode = modeAttachments
+		m.modeReturn = modeAttachments
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(
+			"uploaded "+filepath.Base(path), "issue", func() error {
+				_, err := svc.AddAttachment(key, path)
+				return err
+			}))
 	case "watchers":
 		desired := stringSliceFromAny(msg.Values)
 		key := m.key
@@ -1565,7 +1721,7 @@ func stringSliceFromAny(vs []any) []string {
 type issueKeys struct {
 	Up, Down, Enter, Back, Quit, Help key.Binding
 
-	TabDesc, TabComments, TabLinks, TabTransitions key.Binding
+	TabDesc, TabComments, TabLinks, TabAttachments, TabTransitions key.Binding
 
 	OpenBrowser, EditDescription, EditSummary, NewComment key.Binding
 	AssignMe, AssignPick, Unassign                        key.Binding
@@ -1574,6 +1730,7 @@ type issueKeys struct {
 	EditFixVersions, EditDueDate, EditStoryPoints         key.Binding
 	AddLink, RemoveLink                                   key.Binding
 	ToggleWatch, EditWatchers                             key.Binding
+	UploadAttachment, DeleteAttachment                    key.Binding
 	EditComment, DeleteComment, ConfirmYes, ConfirmNo     key.Binding
 }
 
@@ -1589,6 +1746,7 @@ func defaultIssueKeys() issueKeys {
 		TabDesc:        key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "description")),
 		TabComments:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "comments")),
 		TabLinks:       key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "links")),
+		TabAttachments: key.NewBinding(key.WithKeys("f"), key.WithHelp("f", "files")),
 		TabTransitions: key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "transitions")),
 
 		OpenBrowser:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
@@ -1609,6 +1767,8 @@ func defaultIssueKeys() issueKeys {
 		RemoveLink:      key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "remove link")),
 		ToggleWatch:     key.NewBinding(key.WithKeys("w"), key.WithHelp("w", "watch toggle")),
 		EditWatchers:    key.NewBinding(key.WithKeys("W"), key.WithHelp("W", "watchers…")),
+		UploadAttachment: key.NewBinding(key.WithKeys("F"), key.WithHelp("F", "upload file…")),
+		DeleteAttachment: key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete file")),
 		NewComment:      key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new comment")),
 		EditComment:     key.NewBinding(key.WithKeys("E"), key.WithHelp("E", "edit comment")),
 		DeleteComment:   key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete comment")),
@@ -1624,11 +1784,12 @@ func (k issueKeys) ShortHelp() []key.Binding {
 }
 func (k issueKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.TabDesc, k.TabComments, k.TabLinks, k.TabTransitions},
+		{k.TabDesc, k.TabComments, k.TabLinks, k.TabAttachments, k.TabTransitions},
 		{k.AssignMe, k.AssignPick, k.Unassign, k.EditSummary, k.EditDescription, k.OpenBrowser},
 		{k.PickPriority, k.PickType, k.PickSprint, k.EditLabels, k.EditComponents},
 		{k.EditFixVersions, k.EditDueDate, k.EditStoryPoints},
 		{k.AddLink, k.RemoveLink, k.ToggleWatch, k.EditWatchers},
+		{k.UploadAttachment, k.DeleteAttachment, k.OpenBrowser},
 		{k.NewComment, k.EditComment, k.DeleteComment},
 		{k.Up, k.Down, k.Enter, k.Help, k.Back, k.Quit},
 	}
