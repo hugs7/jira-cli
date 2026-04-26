@@ -69,6 +69,10 @@ type boardModel struct {
 	keys    boardKeys
 	action  *BoardAction
 
+	// vim-style two-key prefix (`gg` → top). Set by the first `g`,
+	// cleared by anything else / a 750ms timeout.
+	pendingG bool
+
 	vp        viewport.Model // body scroll for tall columns
 	headerRow string         // sticky column-header strip rendered above vp
 }
@@ -169,6 +173,9 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loading > 0 {
 			m.loading--
 		}
+		// Title chips depend on cfg; relayout so chrome height is
+		// re-measured before the next render.
+		m.layout()
 		m.composeBody()
 		// Now that we know the columns, kick off issues load too.
 		m.loading++
@@ -186,6 +193,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loading > 0 {
 			m.loading--
 		}
+		m.layout()
 		return m, nil
 
 	case boardIssuesMsg:
@@ -195,11 +203,24 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading--
 		}
 		m.clampCursor()
+		m.layout()
 		m.composeBody()
 		m.snapVP()
 		return m, nil
 
 	case tea.KeyMsg:
+		// vim two-key prefix: a second `g` after the first means
+		// "top". Any other key clears the prefix.
+		if m.pendingG && msg.String() == "g" {
+			m.pendingG = false
+			m.rowCursor = 0
+			m.composeBody()
+			m.vp.GotoTop()
+			return m, nil
+		}
+		if msg.String() != "g" {
+			m.pendingG = false
+		}
 		switch {
 		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
@@ -221,12 +242,56 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.snapVP()
 		case key.Matches(msg, m.keys.Top):
 			m.rowCursor = 0
+			m.pendingG = true // allow `gg` for symmetry with vim
 			m.composeBody()
 			m.vp.GotoTop()
+			return m, nil
 		case key.Matches(msg, m.keys.Bottom):
 			if n := len(m.currentColIssues()); n > 0 {
 				m.rowCursor = n - 1
 			}
+			m.composeBody()
+			m.snapVP()
+			// Belt-and-braces: ensure we land at the very last line
+			// of viewport content too (covers off-by-one when other
+			// columns are taller than the current one).
+			m.vp.GotoBottom()
+			m.snapVP() // re-snap so cursor is still in view
+		case key.Matches(msg, m.keys.HalfDown):
+			m.moveRow(m.cardsPerHalfPage())
+			m.composeBody()
+			m.snapVP()
+		case key.Matches(msg, m.keys.HalfUp):
+			m.moveRow(-m.cardsPerHalfPage())
+			m.composeBody()
+			m.snapVP()
+		case key.Matches(msg, m.keys.PageDown):
+			m.moveRow(m.cardsPerPage())
+			m.composeBody()
+			m.snapVP()
+		case key.Matches(msg, m.keys.PageUp):
+			m.moveRow(-m.cardsPerPage())
+			m.composeBody()
+			m.snapVP()
+		case key.Matches(msg, m.keys.FirstCol):
+			m.colCursor = 0
+			m.rowCursor = 0
+			m.colOffset = 0
+			m.composeBody()
+			m.vp.GotoTop()
+		case key.Matches(msg, m.keys.LastCol):
+			if n := len(m.grouped); n > 0 {
+				m.colCursor = n - 1
+				m.rowCursor = 0
+			}
+			m.snapColOffset()
+			m.composeBody()
+			m.vp.GotoTop()
+		case key.Matches(msg, m.keys.Help):
+			m.help.ShowAll = !m.help.ShowAll
+			// Help row height changes between short/full → relayout
+			// so the viewport is sized correctly for the new chrome.
+			m.layout()
 			m.composeBody()
 			m.snapVP()
 		case key.Matches(msg, m.keys.Refresh):
@@ -300,6 +365,30 @@ func (m *boardModel) cardAtCursor() (api.Issue, bool) {
 		return api.Issue{}, false
 	}
 	return col[m.rowCursor], true
+}
+
+// cardsPerPage returns the number of cards that fit in the body
+// viewport — the unit for ⌃f / ⌃b style full-page navigation.
+// Always at least 1 so the keys can't deadlock on a tiny terminal.
+func (m *boardModel) cardsPerPage() int {
+	if m.vp.Height <= 0 {
+		return 1
+	}
+	n := m.vp.Height / cardRows
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// cardsPerHalfPage is half a page (rounded up), the conventional
+// vim ⌃d / ⌃u stride.
+func (m *boardModel) cardsPerHalfPage() int {
+	n := m.cardsPerPage() / 2
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 func (m *boardModel) moveCol(d int) {
@@ -466,6 +555,95 @@ func (m boardModel) View() string {
 	}
 
 	// --- title bar ---
+	header := m.renderTitleBar()
+
+	// --- footer ---
+	help := m.help.View(m.keys)
+	return strings.Join([]string{header, "", m.headerRow, m.vp.View(), help + m.boardScrollHint()}, "\n")
+}
+
+// layout sizes the body viewport. The chrome height is *measured*
+// rather than hard-coded because:
+//   - the title bar may wrap onto a second line when the project +
+//     sprint name is long for the current terminal width;
+//   - the help row grows from 1 line (short) to 2 lines (full) when
+//     the user toggles ?.
+// Hard-coding "4" used to mean the bottom card on a long board got
+// clipped by however many lines the chrome had grown by — pressing G
+// looked like it didn't scroll quite far enough.
+func (m *boardModel) layout() {
+	w := m.width
+	if w < 30 {
+		w = 30
+	}
+	// We use *visual* height (accounting for terminal-width line
+	// wrapping) rather than lipgloss.Height which only counts \n.
+	// Without this, on a narrow terminal the title bar wraps onto a
+	// second visual row but layout still allocates the viewport as
+	// if it didn't — pushing the bottom card off-screen and making
+	// G look like it doesn't scroll quite far enough.
+	titleH := visualHeight(m.renderTitleBar(), m.width)
+	helpH := visualHeight(m.help.View(m.keys)+m.boardScrollHint(), m.width)
+	// Layout: title (titleH) + blank (1) + sticky col header (1) +
+	// vp (h) + footer (helpH).  Joined by 4 \n separators which add
+	// no extra physical lines beyond what each block contributes.
+	chromeH := titleH + 1 + 1 + helpH
+	h := m.height - chromeH
+	if h < 5 {
+		h = 5
+	}
+	m.vp.Width = w
+	m.vp.Height = h
+}
+
+// boardScrollHint returns the "cols 1-3 of 7" footer suffix when
+// horizontal scrolling is active, "" otherwise. Extracted so the
+// layout chrome calc matches what View() actually renders.
+func (m *boardModel) boardScrollHint() string {
+	if m.cfg == nil {
+		return ""
+	}
+	visible := m.visibleColumns()
+	if len(m.grouped) <= visible {
+		return ""
+	}
+	from := m.colOffset
+	to := from + visible
+	if to > len(m.grouped) {
+		to = len(m.grouped)
+	}
+	return paneMutedStyle.Render(
+		fmt.Sprintf("  cols %d-%d of %d (h/l to scroll)", from+1, to, len(m.grouped)))
+}
+
+// visualHeight returns the number of physical terminal rows the
+// rendered string s will occupy at the given terminal width. Each
+// logical line is divided by termWidth (round-up) to capture the
+// fact that long lines wrap visually. If termWidth <= 0 we fall
+// back to lipgloss.Height (logical lines only).
+func visualHeight(s string, termWidth int) int {
+	if termWidth <= 0 {
+		return lipgloss.Height(s)
+	}
+	h := 0
+	for _, line := range strings.Split(s, "\n") {
+		w := lipgloss.Width(line)
+		if w == 0 {
+			h++
+			continue
+		}
+		h += (w + termWidth - 1) / termWidth
+	}
+	return h
+}
+
+// renderTitleBar produces the same title bar View() will display.
+// Extracted so layout() can measure its height without duplicating
+// the chip-assembly logic.
+func (m *boardModel) renderTitleBar() string {
+	if m.cfg == nil {
+		return titleBar("BOARD", titleChipDim.Render("loading…"))
+	}
 	chips := []string{}
 	if m.cfg.Board.ProjectKey != "" {
 		chips = append(chips, titleChip.Render(m.cfg.Board.ProjectKey))
@@ -486,41 +664,7 @@ func (m boardModel) View() string {
 	if m.loading > 0 {
 		chips = append(chips, paneMutedStyle.Render(m.spinner.View()+" loading"))
 	}
-	header := titleBar("BOARD · "+m.cfg.Board.Name, chips...)
-
-	// --- footer ---
-	visible := m.visibleColumns()
-	from := m.colOffset
-	to := from + visible
-	if to > len(m.grouped) {
-		to = len(m.grouped)
-	}
-	scrollHint := ""
-	if len(m.grouped) > visible {
-		scrollHint = paneMutedStyle.Render(
-			fmt.Sprintf("  cols %d-%d of %d (h/l to scroll)", from+1, to, len(m.grouped)))
-	}
-	help := m.help.View(m.keys)
-	return strings.Join([]string{header, "", m.headerRow, m.vp.View(), help + scrollHint}, "\n")
-}
-
-// layout sizes the body viewport. The visible chrome is:
-//   - title bar          (1 line)
-//   - blank spacer       (1 line)
-//   - sticky header row  (1 line)
-//   - footer / help      (1 line)
-func (m *boardModel) layout() {
-	const chromeH = 4
-	h := m.height - chromeH
-	if h < 5 {
-		h = 5
-	}
-	w := m.width
-	if w < 30 {
-		w = 30
-	}
-	m.vp.Width = w
-	m.vp.Height = h
+	return titleBar("BOARD · "+m.cfg.Board.Name, chips...)
 }
 
 // composeBody recomputes the sticky header strip and the cards-only
@@ -612,12 +756,19 @@ func (m *boardModel) renderColumnCards(idx, width int) string {
 	if len(m.grouped[idx]) == 0 {
 		return emptyColPlaceholder.Width(width).Render("  (empty)")
 	}
-	var b strings.Builder
+	// Render each card as a discrete block, then JoinVertical with
+	// Left alignment + an explicit width so lipgloss pads every line
+	// (including the cards' bottom-margin line) to exactly `width`.
+	// String-concatenating styled blocks loses that geometry, so the
+	// trailing margin line of card N has width 0 and JoinHorizontal
+	// shifts every subsequent column right by one card width.
+	blocks := make([]string, 0, len(m.grouped[idx]))
 	for ri, iss := range m.grouped[idx] {
 		selected := idx == m.colCursor && ri == m.rowCursor
-		b.WriteString(renderBoardCard(iss, width, selected))
+		blocks = append(blocks, renderBoardCard(iss, width, selected))
 	}
-	return b.String()
+	col := lipgloss.JoinVertical(lipgloss.Left, blocks...)
+	return lipgloss.NewStyle().Width(width).Render(col)
 }
 
 func renderBoardCard(iss api.Issue, width int, selected bool) string {
@@ -745,27 +896,36 @@ func totalWords(lines []string) int {
 // ---------- key map ----------
 
 type boardKeys struct {
-	Up, Down, Left, Right key.Binding
-	Top, Bottom           key.Binding
-	Enter, Open           key.Binding
-	Sprint, Refresh       key.Binding
-	Help, Quit            key.Binding
+	Up, Down, Left, Right        key.Binding
+	HalfDown, HalfUp             key.Binding // Ctrl-d / Ctrl-u
+	PageDown, PageUp             key.Binding // Ctrl-f / Ctrl-b
+	Top, Bottom                  key.Binding
+	FirstCol, LastCol            key.Binding // 0 / $
+	Enter, Open                  key.Binding
+	Sprint, Refresh              key.Binding
+	Help, Quit                   key.Binding
 }
 
 func defaultBoardKeys() boardKeys {
 	return boardKeys{
-		Up:      key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "card up")),
-		Down:    key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "card down")),
-		Left:    key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "column left")),
-		Right:   key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "column right")),
-		Top:     key.NewBinding(key.WithKeys("g", "home"), key.WithHelp("g", "top")),
-		Bottom:  key.NewBinding(key.WithKeys("G", "end"), key.WithHelp("G", "bottom")),
-		Enter:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
-		Open:    key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
-		Sprint:  key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
-		Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
-		Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "back")),
+		Up:       key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "card up")),
+		Down:     key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "card down")),
+		Left:     key.NewBinding(key.WithKeys("left", "h"), key.WithHelp("←/h", "column left")),
+		Right:    key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "column right")),
+		HalfDown: key.NewBinding(key.WithKeys("ctrl+d"), key.WithHelp("⌃d", "½ page down")),
+		HalfUp:   key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("⌃u", "½ page up")),
+		PageDown: key.NewBinding(key.WithKeys("ctrl+f", "pgdown"), key.WithHelp("⌃f", "page down")),
+		PageUp:   key.NewBinding(key.WithKeys("ctrl+b", "pgup"), key.WithHelp("⌃b", "page up")),
+		Top:      key.NewBinding(key.WithKeys("g", "home"), key.WithHelp("g/gg", "top")),
+		Bottom:   key.NewBinding(key.WithKeys("G", "end"), key.WithHelp("G", "bottom")),
+		FirstCol: key.NewBinding(key.WithKeys("0", "^"), key.WithHelp("0", "first column")),
+		LastCol:  key.NewBinding(key.WithKeys("$"), key.WithHelp("$", "last column")),
+		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
+		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
+		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
+		Refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "back")),
 	}
 }
 
@@ -774,7 +934,8 @@ func (k boardKeys) ShortHelp() []key.Binding {
 }
 func (k boardKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom},
-		{k.Enter, k.Open, k.Sprint, k.Refresh, k.Help, k.Quit},
+		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom, k.FirstCol, k.LastCol},
+		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
+		{k.Sprint, k.Refresh, k.Help, k.Quit},
 	}
 }
