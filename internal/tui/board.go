@@ -76,6 +76,10 @@ type boardModel struct {
 
 	vp        viewport.Model // body scroll for tall columns
 	headerRow string         // sticky column-header strip rendered above vp
+
+	// picker is the active modal overlay (currently used only by the
+	// inline "create issue" flow). nil when no picker is open.
+	picker *pickerModel
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
@@ -118,6 +122,14 @@ type boardSprintsMsg struct {
 type cardMovedMsg struct {
 	label string
 	err   error
+}
+
+// issueCreatedMsg is the result of an inline-create (c). On success
+// key is the new issue's key so the status row can show it; on
+// error err is non-nil.
+type issueCreatedMsg struct {
+	key string
+	err error
 }
 
 func (m *boardModel) fetchConfig() tea.Cmd {
@@ -203,6 +215,56 @@ func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 	}
 }
 
+// openCreatePicker opens a free-text picker for the user to type a
+// summary for a new issue. Submitting a non-empty value triggers
+// createIssueCmd; an empty value cancels.
+func (m *boardModel) openCreatePicker() tea.Cmd {
+	if m.cfg == nil || m.cfg.Board.ProjectKey == "" {
+		m.status = "✗ board has no project — can't create"
+		return nil
+	}
+	loader := func(query string, token int) tea.Cmd {
+		return func() tea.Msg {
+			return pickerLoadedMsg{Token: token}
+		}
+	}
+	title := "Create issue in " + m.cfg.Board.ProjectKey
+	p := NewAsyncPicker("newissue", title, "summary…", loader)
+	p.SetSize(m.width, m.height)
+	p.EnableFreeText()
+	m.picker = p
+	return p.Init()
+}
+
+// createIssueCmd posts the new issue via CreateIssue. If the board
+// is filtered to an active sprint, the new issue is then moved into
+// that sprint so it actually appears on the current view.
+func (m *boardModel) createIssueCmd(summary string) tea.Cmd {
+	if m.cfg == nil {
+		return nil
+	}
+	svc := m.svc
+	project := m.cfg.Board.ProjectKey
+	sprint := m.sprint
+	m.loading++
+	return func() tea.Msg {
+		iss, err := svc.CreateIssue(api.CreateIssueInput{
+			Project: project,
+			Summary: summary,
+		})
+		if err != nil {
+			return issueCreatedMsg{err: err}
+		}
+		if sprint > 0 {
+			// Best-effort: if the sprint move fails (custom-field
+			// not present, permissions, …) we still surface the
+			// successful create rather than treating it as failure.
+			_ = svc.MoveIssueToSprint(iss.Key, sprint)
+		}
+		return issueCreatedMsg{key: iss.Key}
+	}
+}
+
 // ---------- update ----------
 
 func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -212,6 +274,9 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		m.composeBody()
+		if m.picker != nil {
+			m.picker.SetSize(m.width, m.height)
+		}
 		return m, nil
 
 	case tea.MouseMsg:
@@ -223,10 +288,59 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
-		if m.loading > 0 {
-			return m, cmd
+		var pCmd tea.Cmd
+		if m.picker != nil {
+			pCmd, _ = m.picker.Update(msg)
+		}
+		if m.loading > 0 || m.picker != nil {
+			return m, tea.Batch(cmd, pCmd)
 		}
 		return m, nil
+
+	case pickerLoadedMsg, pickerTickMsg:
+		if m.picker == nil {
+			return m, nil
+		}
+		cmd, _ := m.picker.Update(msg)
+		return m, cmd
+
+	case pickerDoneMsg:
+		m.picker = nil
+		if msg.Cancelled {
+			m.status = "create cancelled"
+			m.layout()
+			return m, nil
+		}
+		switch msg.Purpose {
+		case "newissue":
+			summary, _ := msg.Value.(string)
+			summary = strings.TrimSpace(summary)
+			if summary == "" {
+				m.status = "✗ summary cannot be empty"
+				m.layout()
+				return m, nil
+			}
+			cmd := m.createIssueCmd(summary)
+			if cmd == nil {
+				return m, nil
+			}
+			return m, tea.Batch(m.spinner.Tick, cmd)
+		}
+		return m, nil
+
+	case issueCreatedMsg:
+		if m.loading > 0 {
+			m.loading--
+		}
+		if msg.err != nil {
+			m.status = "✗ create: " + msg.err.Error()
+			m.layout()
+			return m, nil
+		}
+		m.status = "✓ created " + msg.key
+		m.layout()
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
 
 	case boardConfigMsg:
 		if msg.err != nil {
@@ -291,6 +405,11 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Picker eats all keys (including q/esc → cancel) while open.
+		if m.picker != nil {
+			cmd, _ := m.picker.Update(msg)
+			return m, cmd
+		}
 		// vim two-key prefix: a second `g` after the first means
 		// "top". Any other key clears the prefix.
 		if m.pendingG && msg.String() == "g" {
@@ -383,6 +502,11 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case key.Matches(msg, m.keys.MoveRight):
 			if cmd := m.moveCardCmd(1); cmd != nil {
+				return m, tea.Batch(m.spinner.Tick, cmd)
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.Create):
+			if cmd := m.openCreatePicker(); cmd != nil {
 				return m, tea.Batch(m.spinner.Tick, cmd)
 			}
 			return m, nil
@@ -649,8 +773,21 @@ func (m boardModel) View() string {
 	// --- title bar ---
 	header := m.renderTitleBar()
 
+	// --- body / picker overlay ---
+	body := m.vp.View()
+	headerRow := m.headerRow
+	if m.picker != nil {
+		// Centre the picker over the body area; suppress the
+		// sticky column header so the modal isn't visually
+		// crowded.
+		body = lipgloss.Place(m.width, m.vp.Height,
+			lipgloss.Center, lipgloss.Center,
+			m.picker.View(),
+			lipgloss.WithWhitespaceChars(" "))
+		headerRow = strings.Repeat(" ", m.width)
+	}
 	// --- footer ---
-	return strings.Join([]string{header, "", m.headerRow, m.vp.View(), m.renderFooter()}, "\n")
+	return strings.Join([]string{header, "", headerRow, body, m.renderFooter()}, "\n")
 }
 
 // renderFooter composes the status + help row. Used both by View
@@ -1013,6 +1150,7 @@ type boardKeys struct {
 	Top, Bottom                  key.Binding
 	FirstCol, LastCol            key.Binding // 0 / $
 	MoveLeft, MoveRight          key.Binding // H / L — drag card
+	Create                       key.Binding // c — inline new issue
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
 	Help, Quit                   key.Binding
@@ -1034,6 +1172,7 @@ func defaultBoardKeys() boardKeys {
 		LastCol:   key.NewBinding(key.WithKeys("$"), key.WithHelp("$", "last column")),
 		MoveLeft:  key.NewBinding(key.WithKeys("H"), key.WithHelp("H", "drag card left")),
 		MoveRight: key.NewBinding(key.WithKeys("L"), key.WithHelp("L", "drag card right")),
+		Create:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "create issue…")),
 		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
@@ -1050,7 +1189,7 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom, k.FirstCol, k.LastCol},
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
-		{k.MoveLeft, k.MoveRight},
+		{k.MoveLeft, k.MoveRight, k.Create},
 		{k.Sprint, k.Refresh, k.Help, k.Quit},
 	}
 }
