@@ -425,36 +425,56 @@ type srvBoardPage struct {
 	Total      int        `json:"total"`
 }
 
+// ListBoards paginates through every board on the host (or every
+// board in `projectKey` when set) until the server reports IsLast or
+// max is reached. Passing max <= 0 means "fetch them all".
 func (s *serverService) ListBoards(projectKey, kind string, max int) ([]Board, error) {
-	if max <= 0 {
-		max = 50
+	const pageSize = 100 // Jira caps individual board responses
+	if max == 0 {
+		max = -1 // signal "everything"
 	}
-	params := map[string]string{"maxResults": itoa(max)}
-	if projectKey != "" {
-		params["projectKeyOrId"] = projectKey
-	}
-	if kind != "" {
-		params["type"] = strings.ToLower(kind)
-	}
-	var page srvBoardPage
-	if err := s.client.getJSON(s.agileURL("board")+queryString(params), &page); err != nil {
-		// 404 → addon isn't installed; swallow that one. Surface
-		// every other failure (auth, transport, server bugs).
-		if strings.HasPrefix(err.Error(), "HTTP 404") {
-			return []Board{}, nil
+
+	out := []Board{}
+	startAt := 0
+	for {
+		params := map[string]string{
+			"maxResults": itoa(pageSize),
+			"startAt":    itoa(startAt),
 		}
-		return nil, err
+		if projectKey != "" {
+			params["projectKeyOrId"] = projectKey
+		}
+		if kind != "" {
+			params["type"] = strings.ToLower(kind)
+		}
+		var page srvBoardPage
+		if err := s.client.getJSON(s.agileURL("board")+queryString(params), &page); err != nil {
+			// 404 → addon isn't installed. Otherwise surface what
+			// we have so far plus the error.
+			if strings.HasPrefix(err.Error(), "HTTP 404") {
+				return []Board{}, nil
+			}
+			if startAt > 0 {
+				return out, nil // partial result is better than none
+			}
+			return nil, err
+		}
+		for _, b := range page.Values {
+			out = append(out, Board{
+				ID:         b.ID,
+				Name:       b.Name,
+				Type:       b.Type,
+				ProjectKey: b.Location.ProjectKey,
+			})
+			if max > 0 && len(out) >= max {
+				return out, nil
+			}
+		}
+		if page.IsLast || len(page.Values) == 0 {
+			return out, nil
+		}
+		startAt += len(page.Values)
 	}
-	out := make([]Board, 0, len(page.Values))
-	for _, b := range page.Values {
-		out = append(out, Board{
-			ID:         b.ID,
-			Name:       b.Name,
-			Type:       b.Type,
-			ProjectKey: b.Location.ProjectKey,
-		})
-	}
-	return out, nil
 }
 
 type srvBoardConfig struct {
