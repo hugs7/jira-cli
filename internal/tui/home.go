@@ -18,8 +18,10 @@ import (
 )
 
 // HomeAction tells the caller what the user picked from the dashboard.
-// Kind="issue" with Key set means "open the issue viewer for this key".
-// nil action means the user quit cleanly.
+//   - Kind="issue", Key=PROJ-123 → open the issue viewer.
+//   - Kind="boards"              → open the board picker (then board TUI).
+//
+// nil means the user quit cleanly.
 type HomeAction struct {
 	Kind string
 	Key  string
@@ -283,6 +285,9 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.JQL):
 			m.jqlFocus = true
 			return m, m.jqlInput.Focus()
+		case key.Matches(msg, m.keys.Boards):
+			m.action = &HomeAction{Kind: "boards"}
+			return m, tea.Quit
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = len(m.sections)
 			cmds := []tea.Cmd{m.spinner.Tick}
@@ -539,6 +544,7 @@ type homeKeys struct {
 	HalfUp, HalfDown           key.Binding
 	Top, Bottom                key.Binding
 	Enter, Open                key.Binding
+	Boards                     key.Binding
 	Refresh, JQL               key.Binding
 	Help, Quit                 key.Binding
 }
@@ -555,6 +561,7 @@ func defaultHomeKeys() homeKeys {
 		Bottom:   key.NewBinding(key.WithKeys("G", "end"), key.WithHelp("G", "bottom")),
 		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
+		Boards:   key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "boards")),
 		Refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 		JQL:      key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "JQL search")),
 		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
@@ -563,11 +570,11 @@ func defaultHomeKeys() homeKeys {
 }
 
 func (k homeKeys) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Enter, k.Open, k.JQL, k.Refresh, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.Enter, k.Open, k.Boards, k.JQL, k.Refresh, k.Quit}
 }
 func (k homeKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.HalfUp, k.HalfDown, k.Top, k.Bottom},
-		{k.Enter, k.Open, k.JQL, k.Refresh, k.Help, k.Quit},
+		{k.Enter, k.Open, k.Boards, k.JQL, k.Refresh, k.Help, k.Quit},
 	}
 }
