@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -378,6 +379,12 @@ func (m issueModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.openLabelsPicker()
 	case key.Matches(msg, m.keys.EditComponents):
 		return m, m.openComponentsPicker()
+	case key.Matches(msg, m.keys.EditFixVersions):
+		return m, m.openFixVersionsPicker()
+	case key.Matches(msg, m.keys.EditDueDate):
+		return m, m.openDueDatePicker()
+	case key.Matches(msg, m.keys.EditStoryPoints):
+		return m, m.openStoryPointsPicker()
 	case key.Matches(msg, m.keys.Unassign):
 		m.loading++
 		return m, tea.Batch(m.spinner.Tick, m.runAction("unassigned", "issue", func() error {
@@ -959,6 +966,104 @@ func (m *issueModel) openComponentsPicker() tea.Cmd {
 	return p.Init()
 }
 
+// openFixVersionsPicker opens a multi-select chip editor over the
+// project's fix-version catalogue, pre-selecting the issue's current
+// fix versions.
+func (m *issueModel) openFixVersionsPicker() tea.Cmd {
+	projectKey := ""
+	if m.issue != nil {
+		projectKey = m.issue.Project
+	}
+	loader := func(query string, token int) tea.Cmd {
+		svc := m.svc
+		pk := projectKey
+		return func() tea.Msg {
+			vs, err := svc.ListProjectVersions(pk)
+			items := make([]PickerItem, 0, len(vs))
+			for _, v := range vs {
+				items = append(items, PickerItem{
+					Label: v.Name, Sub: v.Description, Value: v.Name,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("fixversions", "Fix versions for "+m.key, "filter…", loader)
+	p.SetSize(m.width, m.height)
+	pre := []any{}
+	if m.issue != nil {
+		for _, v := range m.issue.FixVersions {
+			pre = append(pre, v)
+		}
+	}
+	p.EnableMultiSelect(pre)
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// openDueDatePicker opens a free-text picker (no items) so the user
+// can type a YYYY-MM-DD date. The picker's "+ Add 'X'" row commits
+// X as the new due date. Empty input commits nothing — to clear, the
+// user types "clear" (handled in applyPicker) or "0".
+func (m *issueModel) openDueDatePicker() tea.Cmd {
+	current := ""
+	if m.issue != nil {
+		current = m.issue.DueDate
+	}
+	loader := func(query string, token int) tea.Cmd {
+		return func() tea.Msg {
+			items := []PickerItem{
+				{Label: "(clear)", Sub: "remove due date", Value: ""},
+			}
+			if current != "" {
+				items = append(items, PickerItem{
+					Label: current, Sub: "current value", Value: current,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items}
+		}
+	}
+	p := NewAsyncPicker("duedate", "Due date for "+m.key+" (YYYY-MM-DD)", "YYYY-MM-DD…", loader)
+	p.SetSize(m.width, m.height)
+	p.EnableFreeText()
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// openStoryPointsPicker opens a free-text picker for entering a
+// numeric story-point estimate. Common Fibonacci values are
+// pre-loaded as quick-pick rows.
+func (m *issueModel) openStoryPointsPicker() tea.Cmd {
+	loader := func(query string, token int) tea.Cmd {
+		return func() tea.Msg {
+			// Conventional Fibonacci-ish scale used by most teams.
+			items := []PickerItem{
+				{Label: "0", Sub: "no estimate", Value: "0"},
+				{Label: "0.5", Value: "0.5"},
+				{Label: "1", Value: "1"},
+				{Label: "2", Value: "2"},
+				{Label: "3", Value: "3"},
+				{Label: "5", Value: "5"},
+				{Label: "8", Value: "8"},
+				{Label: "13", Value: "13"},
+				{Label: "21", Value: "21"},
+			}
+			return pickerLoadedMsg{Token: token, Items: items}
+		}
+	}
+	p := NewAsyncPicker("storypoints", "Story points for "+m.key, "type a number…", loader)
+	p.SetSize(m.width, m.height)
+	p.EnableFreeText()
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
 // applyPicker dispatches a finished picker's value to the right API
 // call based on the picker's purpose. Adding a new picker = adding a
 // new case here + a corresponding open*Picker helper.
@@ -1018,8 +1123,51 @@ func (m *issueModel) applyPicker(msg pickerDoneMsg) (tea.Model, tea.Cmd) {
 			fmt.Sprintf("components updated (%d)", len(comps)), "issue", func() error {
 				return m.svc.UpdateComponents(m.key, comps)
 			}))
+	case "fixversions":
+		versions := stringSliceFromAny(msg.Values)
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(
+			fmt.Sprintf("fix versions updated (%d)", len(versions)), "issue", func() error {
+				return m.svc.UpdateFixVersions(m.key, versions)
+			}))
+	case "duedate":
+		date, _ := msg.Value.(string)
+		date = strings.TrimSpace(date)
+		// Validate the format up front so we surface a friendly
+		// error instead of letting Jira's "expected ISO 8601" through.
+		if date != "" && !isValidDueDate(date) {
+			m.status = "✗ due date must be YYYY-MM-DD"
+			return m, nil
+		}
+		label := "due date cleared"
+		if date != "" {
+			label = "due " + date
+		}
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(label, "issue", func() error {
+			return m.svc.UpdateDueDate(m.key, date)
+		}))
+	case "storypoints":
+		raw, _ := msg.Value.(string)
+		raw = strings.TrimSpace(raw)
+		points, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			m.status = "✗ story points must be a number"
+			return m, nil
+		}
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(
+			fmt.Sprintf("story points → %g", points), "issue", func() error {
+				return m.svc.UpdateStoryPoints(m.key, points)
+			}))
 	}
 	return m, nil
+}
+
+// isValidDueDate enforces the YYYY-MM-DD form required by Jira.
+func isValidDueDate(s string) bool {
+	_, err := time.Parse("2006-01-02", s)
+	return err == nil
 }
 
 // stringSliceFromAny converts a picker's []any value list to a
@@ -1045,6 +1193,7 @@ type issueKeys struct {
 	AssignMe, AssignPick, Unassign                        key.Binding
 	PickPriority, PickType, PickSprint                    key.Binding
 	EditLabels, EditComponents                            key.Binding
+	EditFixVersions, EditDueDate, EditStoryPoints         key.Binding
 	EditComment, DeleteComment, ConfirmYes, ConfirmNo     key.Binding
 }
 
@@ -1073,6 +1222,9 @@ func defaultIssueKeys() issueKeys {
 		PickSprint:      key.NewBinding(key.WithKeys("S"), key.WithHelp("S", "sprint…")),
 		EditLabels:      key.NewBinding(key.WithKeys("L"), key.WithHelp("L", "labels…")),
 		EditComponents:  key.NewBinding(key.WithKeys("C"), key.WithHelp("C", "components…")),
+		EditFixVersions: key.NewBinding(key.WithKeys("V"), key.WithHelp("V", "fix versions…")),
+		EditDueDate:     key.NewBinding(key.WithKeys("B"), key.WithHelp("B", "due-by date…")),
+		EditStoryPoints: key.NewBinding(key.WithKeys("#"), key.WithHelp("#", "story points…")),
 		NewComment:      key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new comment")),
 		EditComment:     key.NewBinding(key.WithKeys("E"), key.WithHelp("E", "edit comment")),
 		DeleteComment:   key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete comment")),
@@ -1091,6 +1243,7 @@ func (k issueKeys) FullHelp() [][]key.Binding {
 		{k.TabDesc, k.TabComments, k.TabLinks, k.TabTransitions},
 		{k.AssignMe, k.AssignPick, k.Unassign, k.EditSummary, k.EditDescription, k.OpenBrowser},
 		{k.PickPriority, k.PickType, k.PickSprint, k.EditLabels, k.EditComponents},
+		{k.EditFixVersions, k.EditDueDate, k.EditStoryPoints},
 		{k.NewComment, k.EditComment, k.DeleteComment},
 		{k.Up, k.Down, k.Enter, k.Help, k.Back, k.Quit},
 	}

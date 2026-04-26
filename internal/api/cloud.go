@@ -64,6 +64,12 @@ func (c *cloudService) UpdateIssueType(key, t string) error                 { re
 func (c *cloudService) MoveIssueToSprint(key string, sprintID int) error    { return errCloudTodo }
 func (c *cloudService) UpdateLabels(key string, labels []string) error      { return errCloudTodo }
 func (c *cloudService) UpdateComponents(key string, comps []string) error   { return errCloudTodo }
+func (c *cloudService) UpdateFixVersions(key string, vs []string) error     { return errCloudTodo }
+func (c *cloudService) UpdateDueDate(key, date string) error                { return errCloudTodo }
+func (c *cloudService) UpdateStoryPoints(key string, points float64) error  { return errCloudTodo }
+func (c *cloudService) ListProjectVersions(p string) ([]NamedItem, error) {
+	return []NamedItem{}, nil
+}
 func (c *cloudService) ListPriorities() ([]NamedItem, error)                { return nil, errCloudTodo }
 func (c *cloudService) ListIssueTypes(p string) ([]NamedItem, error)        { return nil, errCloudTodo }
 func (c *cloudService) ListLabels(prefix string, limit int) ([]string, error) {

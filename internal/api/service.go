@@ -49,6 +49,19 @@ type Service interface {
 	// given component names (which must exist in the project).
 	UpdateComponents(key string, components []string) error
 
+	// UpdateFixVersions replaces the fixVersions set on the issue.
+	// Empty slice clears the field. Names must exist on the project.
+	UpdateFixVersions(key string, versions []string) error
+
+	// UpdateDueDate sets the issue's due date in YYYY-MM-DD form.
+	// Empty string clears the field.
+	UpdateDueDate(key, date string) error
+
+	// UpdateStoryPoints sets the issue's story-points custom field.
+	// Implementations discover the right customfield_XXXXX id from
+	// /rest/api/2/field on first use and cache it.
+	UpdateStoryPoints(key string, points float64) error
+
 	// Catalogue endpoints used to populate static pickers.
 	ListPriorities() ([]NamedItem, error)
 	ListIssueTypes(projectKey string) ([]NamedItem, error)
@@ -60,6 +73,10 @@ type Service interface {
 	// ListProjectComponents returns the component catalogue defined
 	// for the given project. Empty slice if components aren't used.
 	ListProjectComponents(projectKey string) ([]NamedItem, error)
+	// ListProjectVersions returns the fix-version catalogue for the
+	// project. Released and archived versions included; the picker
+	// dims them via the Sub field.
+	ListProjectVersions(projectKey string) ([]NamedItem, error)
 	// ListProjectSprints returns active+future sprints across every
 	// board associated with the project (deduped). Empty state =>
 	// "active,future". Used for the sprint picker.
@@ -140,6 +157,30 @@ func (c *Client) getJSON(endpoint string, v any) error {
 		return err
 	}
 	return decode(resp, v)
+}
+
+// getRaw fetches an endpoint and returns the raw response bytes
+// (after a >=400 check). Used when callers need to decode the same
+// JSON twice — once into a typed shape and once into a generic map
+// for fields we don't statically know (e.g. customfield_XXXXX).
+func (c *Client) getRaw(endpoint string) ([]byte, error) {
+	req, err := c.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return body, nil
 }
 
 func (c *Client) postJSON(endpoint string, in, out any) error {

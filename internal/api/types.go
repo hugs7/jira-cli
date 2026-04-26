@@ -23,6 +23,7 @@ type Issue struct {
 	FixVersions []string
 	Sprint      string // active sprint name (best-effort)
 	StoryPoints float64
+	DueDate     string // ISO-8601 date (YYYY-MM-DD); "" if unset
 	ParentKey   string // for sub-tasks / stories under epics
 	EpicKey     string // for issues in an epic
 	WebURL      string

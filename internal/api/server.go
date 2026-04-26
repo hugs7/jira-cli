@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,11 @@ import (
 type serverService struct {
 	client *Client
 	host   string
+
+	// Custom-field IDs cached after first /field discovery. Empty
+	// strings mean "not yet discovered or absent on this instance".
+	cfStoryPoints string
+	cfDiscovered  bool
 }
 
 func (s *serverService) Host() string    { return s.host }
@@ -54,6 +60,7 @@ type srvFields struct {
 	Labels     []string  `json:"labels"`
 	Components []srvNamed `json:"components"`
 	FixVersions []srvNamed `json:"fixVersions"`
+	DueDate    string `json:"duedate"`
 	Created    string `json:"created"`
 	Updated    string `json:"updated"`
 	Parent     *struct {
@@ -181,6 +188,7 @@ func (s *serverService) toIssue(in srvIssue) Issue {
 	for _, v := range in.Fields.FixVersions {
 		out.FixVersions = append(out.FixVersions, v.Name)
 	}
+	out.DueDate = in.Fields.DueDate
 	if in.Fields.Parent != nil {
 		out.ParentKey = in.Fields.Parent.Key
 		// Server marks epics by issuetype name "Epic"; if the parent
@@ -195,13 +203,77 @@ func (s *serverService) toIssue(in srvIssue) Issue {
 // --- methods ---
 
 func (s *serverService) GetIssue(key string) (*Issue, error) {
-	var raw srvIssue
 	endpoint := "issue/" + key
-	if err := s.client.getJSON(endpoint, &raw); err != nil {
+	body, err := s.client.getRaw(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	var raw srvIssue
+	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
 	out := s.toIssue(raw)
+	// Second pass over the same JSON: pull customfield values we
+	// don't know at compile time (story points, sprint, …).
+	var generic struct {
+		Fields map[string]json.RawMessage `json:"fields"`
+	}
+	if err := json.Unmarshal(body, &generic); err == nil {
+		s.applyCustomFields(&out, generic.Fields)
+	}
 	return &out, nil
+}
+
+// applyCustomFields fills in the parts of Issue that depend on
+// per-instance custom-field IDs (story points today; epic link /
+// sprint name later). Best-effort — silent no-op if discovery
+// hasn't found the field on this instance.
+func (s *serverService) applyCustomFields(out *Issue, fields map[string]json.RawMessage) {
+	if !s.cfDiscovered {
+		s.discoverCustomFields()
+	}
+	if s.cfStoryPoints != "" {
+		if v, ok := fields[s.cfStoryPoints]; ok && len(v) > 0 && string(v) != "null" {
+			var f float64
+			if err := json.Unmarshal(v, &f); err == nil {
+				out.StoryPoints = f
+			}
+		}
+	}
+}
+
+// discoverCustomFields hits /field once and caches the IDs of the
+// custom fields we care about (story points). Cheap (~1 HTTP call,
+// dozens-of-KB response) and amortised across the whole session.
+func (s *serverService) discoverCustomFields() {
+	s.cfDiscovered = true // mark even on failure to avoid retrying every call
+	var fields []struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Custom bool   `json:"custom"`
+		Schema struct {
+			Custom string `json:"custom"`
+		} `json:"schema"`
+	}
+	if err := s.client.getJSON("field", &fields); err != nil {
+		return
+	}
+	for _, f := range fields {
+		if !f.Custom {
+			continue
+		}
+		// Match by canonical schema first (stable across instances),
+		// then by name as a fallback.
+		switch {
+		case f.Schema.Custom == "com.atlassian.jira.plugin.system.customfieldtypes:float" &&
+			strings.EqualFold(f.Name, "Story Points"):
+			s.cfStoryPoints = f.ID
+		case strings.EqualFold(f.Name, "Story Points") && s.cfStoryPoints == "":
+			s.cfStoryPoints = f.ID
+		case strings.EqualFold(f.Name, "Story point estimate") && s.cfStoryPoints == "":
+			s.cfStoryPoints = f.ID
+		}
+	}
 }
 
 func (s *serverService) SearchIssues(in SearchInput) ([]Issue, error) {
@@ -348,6 +420,89 @@ func (s *serverService) ListProjectComponents(projectKey string) ([]NamedItem, e
 	out := make([]NamedItem, 0, len(raw))
 	for _, r := range raw {
 		out = append(out, NamedItem{ID: r.ID, Name: r.Name, Description: r.Description})
+	}
+	return out, nil
+}
+
+// UpdateFixVersions replaces the issue's fixVersions field. Versions
+// must already exist in the project's version catalogue.
+func (s *serverService) UpdateFixVersions(key string, versions []string) error {
+	objs := make([]map[string]string, 0, len(versions))
+	for _, v := range versions {
+		if v == "" {
+			continue
+		}
+		objs = append(objs, map[string]string{"name": v})
+	}
+	body := map[string]any{"fields": map[string]any{"fixVersions": objs}}
+	return s.client.putJSON("issue/"+key, body, nil)
+}
+
+// UpdateDueDate sets the standard `duedate` field. Empty clears it.
+// Format must be YYYY-MM-DD; Jira rejects anything else.
+func (s *serverService) UpdateDueDate(key, date string) error {
+	var v any
+	if date == "" {
+		v = nil
+	} else {
+		v = date
+	}
+	body := map[string]any{"fields": map[string]any{"duedate": v}}
+	return s.client.putJSON("issue/"+key, body, nil)
+}
+
+// UpdateStoryPoints writes the per-instance story-points custom
+// field. Returns an explanatory error if the field couldn't be
+// discovered on this instance.
+func (s *serverService) UpdateStoryPoints(key string, points float64) error {
+	if !s.cfDiscovered {
+		s.discoverCustomFields()
+	}
+	if s.cfStoryPoints == "" {
+		return fmt.Errorf("story-points custom field not found on this instance")
+	}
+	body := map[string]any{"fields": map[string]any{s.cfStoryPoints: points}}
+	return s.client.putJSON("issue/"+key, body, nil)
+}
+
+// ListProjectVersions returns the fix-version catalogue for the
+// project. Released / archived state is captured in Description so
+// the picker can show it.
+func (s *serverService) ListProjectVersions(projectKey string) ([]NamedItem, error) {
+	if projectKey == "" {
+		return []NamedItem{}, nil
+	}
+	var raw []struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Released    bool   `json:"released"`
+		Archived    bool   `json:"archived"`
+		ReleaseDate string `json:"releaseDate"`
+	}
+	if err := s.client.getJSON("project/"+projectKey+"/versions", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]NamedItem, 0, len(raw))
+	for _, r := range raw {
+		desc := r.Description
+		var tags []string
+		if r.Archived {
+			tags = append(tags, "archived")
+		}
+		if r.Released {
+			tags = append(tags, "released")
+		}
+		if r.ReleaseDate != "" {
+			tags = append(tags, r.ReleaseDate)
+		}
+		if len(tags) > 0 {
+			if desc != "" {
+				desc += " · "
+			}
+			desc += strings.Join(tags, " · ")
+		}
+		out = append(out, NamedItem{ID: r.ID, Name: r.Name, Description: desc})
 	}
 	return out, nil
 }
