@@ -103,6 +103,9 @@ func (c *cloudService) AddAttachment(key, path string) ([]Attachment, error) {
 	return nil, errCloudTodo
 }
 func (c *cloudService) DeleteAttachment(id string) error { return errCloudTodo }
+func (c *cloudService) CreateIssue(in CreateIssueInput) (*Issue, error) {
+	return nil, errCloudTodo
+}
 func (c *cloudService) ListProjects() ([]Project, error)             { return nil, errCloudTodo }
 func (c *cloudService) ListMyAssigned(max int) ([]Issue, error)      { return []Issue{}, nil }
 func (c *cloudService) ListMentioned(max int) ([]Issue, error)       { return []Issue{}, nil }

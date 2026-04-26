@@ -81,6 +81,11 @@ type Service interface {
 	// DeleteAttachment removes an attachment by id.
 	DeleteAttachment(id string) error
 
+	// CreateIssue creates a new issue and returns the freshly
+	// fetched record. Project + Summary are required; IssueType
+	// defaults to "Task" if blank.
+	CreateIssue(in CreateIssueInput) (*Issue, error)
+
 	// Catalogue endpoints used to populate static pickers.
 	ListPriorities() ([]NamedItem, error)
 	ListIssueTypes(projectKey string) ([]NamedItem, error)

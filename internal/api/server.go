@@ -535,6 +535,36 @@ func (s *serverService) ListProjectVersions(projectKey string) ([]NamedItem, err
 	return out, nil
 }
 
+// CreateIssue posts to /issue with the minimum required field set
+// (project + summary + issuetype) and re-fetches the resulting key
+// so the caller gets a fully-populated Issue.
+func (s *serverService) CreateIssue(in CreateIssueInput) (*Issue, error) {
+	if in.Project == "" {
+		return nil, fmt.Errorf("project is required")
+	}
+	if strings.TrimSpace(in.Summary) == "" {
+		return nil, fmt.Errorf("summary is required")
+	}
+	itype := in.IssueType
+	if itype == "" {
+		itype = "Task"
+	}
+	body := map[string]any{
+		"fields": map[string]any{
+			"project":   map[string]any{"key": in.Project},
+			"summary":   in.Summary,
+			"issuetype": map[string]any{"name": itype},
+		},
+	}
+	var raw struct {
+		Key string `json:"key"`
+	}
+	if err := s.client.postJSON("issue", body, &raw); err != nil {
+		return nil, err
+	}
+	return s.GetIssue(raw.Key)
+}
+
 // MoveIssueToSprint uses the Agile API: PUT /sprint/{id}/issue to
 // add, POST /backlog/issue when sprintID == 0.
 func (s *serverService) MoveIssueToSprint(key string, sprintID int) error {

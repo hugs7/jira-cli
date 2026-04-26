@@ -120,6 +120,14 @@ type SearchInput struct {
 	MaxResults int
 }
 
+// CreateIssueInput is the payload for creating a new issue. Project
+// and Summary are required; IssueType defaults to "Task" when blank.
+type CreateIssueInput struct {
+	Project   string
+	Summary   string
+	IssueType string
+}
+
 // Board is one Jira Software / Agile board (Scrum or Kanban).
 type Board struct {
 	ID         int
