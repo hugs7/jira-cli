@@ -70,6 +70,17 @@ type Service interface {
 	// RemoveWatcher removes username/accountID from the watcher list.
 	RemoveWatcher(key, user string) error
 
+	// ListAttachments returns the attachments on an issue. The Issue
+	// returned by GetIssue already includes them; this is mainly for
+	// post-action refreshes that don't want a full GetIssue.
+	ListAttachments(key string) ([]Attachment, error)
+	// AddAttachment uploads a single file to the issue and returns
+	// the parsed list of attachments Jira accepted (Jira responds
+	// with the new attachments only).
+	AddAttachment(key, path string) ([]Attachment, error)
+	// DeleteAttachment removes an attachment by id.
+	DeleteAttachment(id string) error
+
 	// Catalogue endpoints used to populate static pickers.
 	ListPriorities() ([]NamedItem, error)
 	ListIssueTypes(projectKey string) ([]NamedItem, error)

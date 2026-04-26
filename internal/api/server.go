@@ -1,8 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -74,6 +79,17 @@ type srvFields struct {
 		} `json:"fields"`
 	} `json:"parent"`
 	IssueLinks []srvIssueLink `json:"issuelinks"`
+	Attachment []srvAttachment `json:"attachment"`
+}
+
+type srvAttachment struct {
+	ID       string  `json:"id"`
+	Filename string  `json:"filename"`
+	MimeType string  `json:"mimeType"`
+	Size     int64   `json:"size"`
+	Author   srvUser `json:"author"`
+	Created  string  `json:"created"`
+	Content  string  `json:"content"`
 }
 
 type srvIssueLink struct {
@@ -197,6 +213,9 @@ func (s *serverService) toIssue(in srvIssue) Issue {
 	if in.Fields.Watches != nil {
 		out.Watching = in.Fields.Watches.IsWatching
 		out.WatchCount = in.Fields.Watches.WatchCount
+	}
+	for _, a := range in.Fields.Attachment {
+		out.Attachments = append(out.Attachments, s.toAttachment(a))
 	}
 	if in.Fields.Parent != nil {
 		out.ParentKey = in.Fields.Parent.Key
@@ -802,6 +821,91 @@ func (s *serverService) RemoveWatcher(key, user string) error {
 	}
 	endpoint := "issue/" + key + "/watchers" + queryString(map[string]string{"username": user})
 	return s.client.deleteJSON(endpoint)
+}
+
+// toAttachment converts a raw srvAttachment into the unified
+// Attachment type. BrowseURL is built from the API content URL —
+// stripping /secure/attachment/{id}/{name} back to the human
+// /browse/{key} form isn't possible from this payload, so we point
+// users at the same content URL the Jira UI uses.
+func (s *serverService) toAttachment(a srvAttachment) Attachment {
+	return Attachment{
+		ID:        a.ID,
+		Filename:  a.Filename,
+		MimeType:  a.MimeType,
+		Size:      a.Size,
+		Author:    a.Author.DisplayName,
+		CreatedAt: parseTime(a.Created),
+		URL:       a.Content,
+		BrowseURL: a.Content,
+	}
+}
+
+// ListAttachments returns the issue's attachments by fetching the
+// `attachment` field only — cheaper than a full GetIssue when the
+// caller just refreshed via add/delete.
+func (s *serverService) ListAttachments(key string) ([]Attachment, error) {
+	var raw struct {
+		Fields struct {
+			Attachment []srvAttachment `json:"attachment"`
+		} `json:"fields"`
+	}
+	endpoint := "issue/" + key + queryString(map[string]string{"fields": "attachment"})
+	if err := s.client.getJSON(endpoint, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]Attachment, 0, len(raw.Fields.Attachment))
+	for _, a := range raw.Fields.Attachment {
+		out = append(out, s.toAttachment(a))
+	}
+	return out, nil
+}
+
+// DeleteAttachment removes an attachment by id.
+func (s *serverService) DeleteAttachment(id string) error {
+	return s.client.deleteJSON("attachment/" + id)
+}
+
+// AddAttachment uploads a single file to the issue. Jira's upload
+// endpoint requires multipart/form-data, the X-Atlassian-Token
+// header to suppress XSRF checks, and the form field "file".
+func (s *serverService) AddAttachment(key, path string) ([]Attachment, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile("file", filepath.Base(path))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return nil, err
+	}
+	if err := mw.Close(); err != nil {
+		return nil, err
+	}
+	req, err := s.client.NewRequest("POST", "issue/"+key+"/attachments", &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-Atlassian-Token", "no-check")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	var raw []srvAttachment
+	if err := decode(resp, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]Attachment, 0, len(raw))
+	for _, a := range raw {
+		out = append(out, s.toAttachment(a))
+	}
+	return out, nil
 }
 
 func (s *serverService) ListProjects() ([]Project, error) {

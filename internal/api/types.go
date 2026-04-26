@@ -31,6 +31,22 @@ type Issue struct {
 	WebURL      string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	Attachments []Attachment
+}
+
+// Attachment is a file uploaded to an issue. URL is the
+// authenticated content endpoint (download requires the same auth as
+// the API calls); BrowseURL is the human-friendly link the Jira UI
+// shows in the issue's attachment panel.
+type Attachment struct {
+	ID        string
+	Filename  string
+	MimeType  string
+	Size      int64
+	Author    string
+	CreatedAt time.Time
+	URL       string
+	BrowseURL string
 }
 
 // Comment is a unified Jira comment representation.
