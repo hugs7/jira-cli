@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -67,6 +68,8 @@ type boardModel struct {
 	help    help.Model
 	keys    boardKeys
 	action  *BoardAction
+
+	vp viewport.Model // body scroll for tall columns
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
@@ -80,6 +83,7 @@ func newBoardModel(svc api.Service, boardID int) boardModel {
 		help:    help.New(),
 		keys:    defaultBoardKeys(),
 		loading: 2, // config + sprints
+		vp:      viewport.New(0, 0),
 	}
 }
 
@@ -136,7 +140,14 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.layout()
 		return m, nil
+
+	case tea.MouseMsg:
+		// Wheel scrolls the body without disturbing the cursor.
+		var cmd tea.Cmd
+		m.vp, cmd = m.vp.Update(msg)
+		return m, cmd
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -189,18 +200,24 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.Left):
 			m.moveCol(-1)
+			m.snapVP()
 		case key.Matches(msg, m.keys.Right):
 			m.moveCol(1)
+			m.snapVP()
 		case key.Matches(msg, m.keys.Up):
 			m.moveRow(-1)
+			m.snapVP()
 		case key.Matches(msg, m.keys.Down):
 			m.moveRow(1)
+			m.snapVP()
 		case key.Matches(msg, m.keys.Top):
 			m.rowCursor = 0
+			m.vp.GotoTop()
 		case key.Matches(msg, m.keys.Bottom):
 			if n := len(m.currentColIssues()); n > 0 {
 				m.rowCursor = n - 1
 			}
+			m.snapVP()
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
 			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
@@ -445,6 +462,7 @@ func (m boardModel) View() string {
 		cols = append(cols, m.renderColumn(ci, cw))
 	}
 	body := lipgloss.JoinHorizontal(lipgloss.Top, cols...)
+	m.vp.SetContent(body)
 
 	// --- footer ---
 	scrollHint := ""
@@ -453,8 +471,59 @@ func (m boardModel) View() string {
 			fmt.Sprintf("  cols %d-%d of %d (h/l to scroll)", from+1, to, len(m.grouped)))
 	}
 	help := m.help.View(m.keys)
-	return strings.Join([]string{header, "", body, "", help + scrollHint}, "\n")
+	return strings.Join([]string{header, "", m.vp.View(), help + scrollHint}, "\n")
 }
+
+// layout sizes the body viewport to whatever vertical room is left
+// after the header (1 line + 1 spacer) and footer (1 help line).
+func (m *boardModel) layout() {
+	const headerH = 2
+	const footerH = 1
+	h := m.height - headerH - footerH
+	if h < 5 {
+		h = 5
+	}
+	w := m.width
+	if w < 30 {
+		w = 30
+	}
+	m.vp.Width = w
+	m.vp.Height = h
+}
+
+// snapVP scrolls the viewport so the row holding the selected card
+// is visible. Card heights are constant (cardRows) so the math is
+// straightforward — no need to walk the rendered string.
+func (m *boardModel) snapVP() {
+	if m.vp.Height == 0 {
+		return
+	}
+	top := headerRows + m.rowCursor*cardRows
+	bottom := top + cardRows
+	off := m.vp.YOffset
+	if top < off {
+		off = top
+	} else if bottom > off+m.vp.Height {
+		off = bottom - m.vp.Height
+	}
+	if off < 0 {
+		off = 0
+	}
+	m.vp.SetYOffset(off)
+}
+
+// summaryLines is the fixed line count we wrap card summaries to so
+// every card has identical height — the only way columns line up
+// horizontally when they share a single body string.
+const summaryLines = 2
+
+// cardRows is the rendered height of one card. 2 (border) + 1 (key)
+// + summaryLines + 1 (meta) + 1 (margin). Used by snap-to-cursor.
+const cardRows = 2 + 1 + summaryLines + 1 + 1
+
+// headerRows is the rendered height of a column header (always 1
+// line because we truncate the header text to fit).
+const headerRows = 1
 
 func (m *boardModel) renderColumn(idx, width int) string {
 	colName := "Other"
@@ -467,7 +536,11 @@ func (m *boardModel) renderColumn(idx, width int) string {
 	if idx == m.colCursor {
 		headStyle = colHeaderStyle
 	}
-	head := headStyle.Width(width).Render(fmt.Sprintf("%s · %d", colName, count))
+	// Truncate to fit *content* area (width minus 2 for the
+	// horizontal padding the style applies). Keeping the header to
+	// a single line is what stops adjacent columns "stepping down".
+	headText := truncateRunes(fmt.Sprintf("%s · %d", colName, count), width-2)
+	head := headStyle.Width(width).Render(headText)
 
 	var b strings.Builder
 	b.WriteString(head)
@@ -484,12 +557,11 @@ func renderBoardCard(iss api.Issue, width int, selected bool) string {
 	if iss.IssueType != "" {
 		keyLine += " " + paneMutedStyle.Render("· "+iss.IssueType)
 	}
-	summary := iss.Summary
 	maxSum := width - 4
 	if maxSum < 8 {
 		maxSum = 8
 	}
-	summary = wrap(summary, maxSum, 3)
+	summary := wrapPad(iss.Summary, maxSum, summaryLines)
 
 	var meta []string
 	if iss.Assignee != "" {
@@ -498,18 +570,48 @@ func renderBoardCard(iss api.Issue, width int, selected bool) string {
 	if iss.StoryPoints > 0 {
 		meta = append(meta, fmt.Sprintf("⛶ %g", iss.StoryPoints))
 	}
+	// Always emit the meta line — empty when there's no metadata —
+	// so every card is exactly the same height.
 	metaLine := paneMutedStyle.Render(strings.Join(meta, "  "))
 
-	body := keyLine + "\n" + summary
-	if metaLine != "" {
-		body += "\n" + metaLine
-	}
+	body := keyLine + "\n" + summary + "\n" + metaLine
 
 	style := cardBorder
 	if selected {
 		style = cardSel
 	}
 	return style.Width(width - 2).Render(body)
+}
+
+// truncateRunes shortens s to at most w display runes, appending an
+// ellipsis when it had to cut. w<=0 returns the empty string.
+func truncateRunes(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	rs := []rune(s)
+	if len(rs) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	return string(rs[:w-1]) + "…"
+}
+
+// wrapPad word-wraps s to lines of at most w runes, padded or
+// truncated to exactly `lines` rows. The constant card height is
+// what keeps the columns aligned in JoinHorizontal.
+func wrapPad(s string, w, lines int) string {
+	out := wrap(s, w, lines)
+	parts := strings.Split(out, "\n")
+	for len(parts) < lines {
+		parts = append(parts, "")
+	}
+	if len(parts) > lines {
+		parts = parts[:lines]
+	}
+	return strings.Join(parts, "\n")
 }
 
 // wrap word-wraps `s` into lines of at most `w` runes, capped at
