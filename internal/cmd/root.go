@@ -1,8 +1,6 @@
 package cmd
 
 import (
-	"fmt"
-
 	"github.com/spf13/cobra"
 
 	"github.com/hugs7/jira-cli/internal/config"
@@ -54,16 +52,10 @@ func NewRootCmd(info BuildInfo) *cobra.Command {
 					if err := tui.Issue(svc, action.Key); err != nil {
 						return err
 					}
-				case "boards":
-					boardID, err := pickBoard(svc, "", "")
-					if err != nil {
-						fmt.Fprintln(cmd.ErrOrStderr(), "✗", err)
-						continue
-					}
-					if boardID == 0 {
-						continue
-					}
-					// Inner loop: board → issue → board.
+				case "board":
+					// Inner loop: board → issue → board → … so the
+					// user can drill down without losing their place.
+					boardID := action.BoardID
 					for {
 						act, err := tui.Board(svc, boardID)
 						if err != nil {

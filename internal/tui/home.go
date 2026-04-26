@@ -18,20 +18,46 @@ import (
 )
 
 // HomeAction tells the caller what the user picked from the dashboard.
-//   - Kind="issue", Key=PROJ-123 → open the issue viewer.
-//   - Kind="boards"              → open the board picker (then board TUI).
+//   - Kind="issue", Key=PROJ-123    → open the issue viewer.
+//   - Kind="board", BoardID=42      → open the Kanban board viewer.
 //
 // nil means the user quit cleanly.
 type HomeAction struct {
-	Kind string
-	Key  string
+	Kind    string
+	Key     string
+	BoardID int
 }
 
-// HomeState lets the caller persist cursor/jql across re-entries so
-// that closing an issue viewer drops you back where you were.
+// HomeState lets the caller persist tab / cursor / search across
+// re-entries so that closing a sub-TUI drops you back where you were.
 type HomeState struct {
-	Cursor int
-	JQL    string
+	Tab          homeTab
+	Cursor       int
+	JQL          string
+	BoardCursor  int
+	BoardFilter  string
+}
+
+// homeTab is one top-level tab on the dashboard. Mirrors the pattern
+// used by bb's home model: keep the tabs few and high-signal so users
+// can flip through them with Tab/Shift+Tab.
+type homeTab int
+
+const (
+	tabDashboard homeTab = iota
+	tabBoards
+)
+
+var allTabs = []homeTab{tabDashboard, tabBoards}
+
+func (t homeTab) name() string {
+	switch t {
+	case tabDashboard:
+		return "Dashboard"
+	case tabBoards:
+		return "Boards"
+	}
+	return "?"
 }
 
 // Home runs the dashboard model and returns whatever action the user
@@ -47,7 +73,13 @@ func Home(svc api.Service, prev *HomeState) (*HomeAction, *HomeState, error) {
 	if !ok {
 		return nil, nil, nil
 	}
-	state := &HomeState{Cursor: hm.cursor, JQL: hm.jqlInput.Value()}
+	state := &HomeState{
+		Tab:         hm.tab,
+		Cursor:      hm.cursor,
+		JQL:         hm.jqlInput.Value(),
+		BoardCursor: hm.boardCursor,
+		BoardFilter: hm.boardsFilter.Value(),
+	}
 	return hm.action, state, nil
 }
 
@@ -64,18 +96,30 @@ type homeSection struct {
 type homeModel struct {
 	svc api.Service
 
+	tab homeTab
+
+	// --- Dashboard tab ---
 	sections []homeSection
 	recent   []config.RecentIssue
+	cursor   int  // section-flat row index across all visible rows
+	jqlFocus bool // user is editing the JQL input
+	jqlInput textinput.Model
+
+	// --- Boards tab ---
+	boards         []api.Board
+	boardsFiltered []api.Board // re-derived after every filter change
+	boardsLoaded   bool
+	boardsLoading  bool
+	boardCursor    int
+	boardsFilter   textinput.Model
+	boardsFocus    bool // typing in the boards filter
 
 	width, height int
-	cursor        int  // section-flat row index across all visible rows
-	jqlFocus      bool // user is editing the JQL input
 
-	jqlInput textinput.Model
-	vp       viewport.Model
-	spinner  spinner.Model
-	help     help.Model
-	keys     homeKeys
+	vp      viewport.Model
+	spinner spinner.Model
+	help    help.Model
+	keys    homeKeys
 
 	loading int
 	status  string
@@ -87,29 +131,25 @@ func newHomeModel(svc api.Service, prev *HomeState) homeModel {
 	ti.Prompt = "JQL › "
 	ti.Placeholder = "assignee = currentUser() AND resolution = Unresolved"
 	ti.CharLimit = 0
-	if prev != nil && prev.JQL != "" {
-		ti.SetValue(prev.JQL)
-	}
+
+	bf := textinput.New()
+	bf.Prompt = "filter › "
+	bf.Placeholder = "name / project key — leave empty for all"
+	bf.CharLimit = 0
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
 
-	cursor := 0
-	if prev != nil {
-		cursor = prev.Cursor
-	}
-
-	cfg := config.Get()
-	return homeModel{
-		svc:      svc,
-		jqlInput: ti,
-		vp:       viewport.New(0, 0),
-		spinner:  sp,
-		help:     help.New(),
-		keys:     defaultHomeKeys(),
-		cursor:   cursor,
-		recent:   cfg.Recent,
+	m := homeModel{
+		svc:          svc,
+		jqlInput:     ti,
+		boardsFilter: bf,
+		vp:           viewport.New(0, 0),
+		spinner:      sp,
+		help:         help.New(),
+		keys:         defaultHomeKeys(),
+		recent:       config.Get().Recent,
 		sections: []homeSection{
 			{title: "Assigned to me", jql: "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"},
 			{title: "Mentions", jql: "text ~ currentUser() AND resolution = Unresolved ORDER BY updated DESC"},
@@ -118,6 +158,18 @@ func newHomeModel(svc api.Service, prev *HomeState) homeModel {
 		},
 		loading: 4,
 	}
+	if prev != nil {
+		m.tab = prev.Tab
+		m.cursor = prev.Cursor
+		m.boardCursor = prev.BoardCursor
+		if prev.JQL != "" {
+			m.jqlInput.SetValue(prev.JQL)
+		}
+		if prev.BoardFilter != "" {
+			m.boardsFilter.SetValue(prev.BoardFilter)
+		}
+	}
+	return m
 }
 
 func (m homeModel) Init() tea.Cmd {
@@ -143,6 +195,11 @@ type searchDoneMsg struct {
 	err    error
 }
 
+type boardsLoadedMsg struct {
+	boards []api.Board
+	err    error
+}
+
 func (m *homeModel) fetchSection(idx int, loader func(int) ([]api.Issue, error)) tea.Cmd {
 	return func() tea.Msg {
 		issues, err := loader(25)
@@ -154,6 +211,14 @@ func (m *homeModel) runSearch(jql string) tea.Cmd {
 	return func() tea.Msg {
 		issues, err := m.svc.SearchIssues(api.SearchInput{JQL: jql, MaxResults: 50})
 		return searchDoneMsg{issues: issues, err: err}
+	}
+}
+
+func (m *homeModel) fetchBoards() tea.Cmd {
+	svc := m.svc
+	return func() tea.Msg {
+		bs, err := svc.ListBoards("", "", 500)
+		return boardsLoadedMsg{boards: bs, err: err}
 	}
 }
 
@@ -221,103 +286,241 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.vp.GotoTop()
 		return m, nil
 
+	case boardsLoadedMsg:
+		m.boardsLoading = false
+		m.boardsLoaded = true
+		if msg.err != nil {
+			m.status = "✗ boards: " + msg.err.Error()
+			return m, nil
+		}
+		m.boards = msg.boards
+		m.applyBoardsFilter()
+		m.vp.SetContent(m.renderBody())
+		return m, nil
+
 	case tea.KeyMsg:
-		// While the JQL input is focused, swallow most keys so the
-		// user can type freely. Esc unfocuses; Enter runs the search.
+		// Filter inputs grab the keystroke first so the user can
+		// type freely. Esc unfocuses; Enter runs the search /
+		// applies the filter.
 		if m.jqlFocus {
-			switch msg.String() {
-			case "esc":
-				m.jqlFocus = false
-				m.jqlInput.Blur()
-				return m, nil
-			case "enter":
-				jql := strings.TrimSpace(m.jqlInput.Value())
-				if jql == "" {
-					return m, nil
-				}
-				m.loading = 1
-				m.jqlFocus = false
-				m.jqlInput.Blur()
-				return m, tea.Batch(m.spinner.Tick, m.runSearch(jql))
-			}
-			var cmd tea.Cmd
-			m.jqlInput, cmd = m.jqlInput.Update(msg)
-			return m, cmd
+			return m.updateJQLFocused(msg)
+		}
+		if m.boardsFocus {
+			return m.updateBoardsFilterFocused(msg)
 		}
 
+		// Universal keys handled the same on every tab.
 		switch {
 		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
-		case key.Matches(msg, m.keys.Up):
-			m.moveCursor(-1)
-			m.vp.SetContent(m.renderBody())
-			m.snapViewportToCursor()
-			return m, nil
-		case key.Matches(msg, m.keys.Down):
-			m.moveCursor(1)
-			m.vp.SetContent(m.renderBody())
-			m.snapViewportToCursor()
-			return m, nil
-		case key.Matches(msg, m.keys.PageUp):
-			m.vp.ViewUp()
-			return m, nil
-		case key.Matches(msg, m.keys.PageDown):
-			m.vp.ViewDown()
-			return m, nil
-		case key.Matches(msg, m.keys.Top):
-			m.cursor = 0
-			m.vp.SetContent(m.renderBody())
-			m.vp.GotoTop()
-			return m, nil
-		case key.Matches(msg, m.keys.Bottom):
-			if n := m.cursorRowCount(); n > 0 {
-				m.cursor = n - 1
-			}
-			m.vp.SetContent(m.renderBody())
-			m.vp.GotoBottom()
-			return m, nil
-		case key.Matches(msg, m.keys.HalfDown):
-			m.vp.HalfViewDown()
-			return m, nil
-		case key.Matches(msg, m.keys.HalfUp):
-			m.vp.HalfViewUp()
-			return m, nil
-		case key.Matches(msg, m.keys.JQL):
-			m.jqlFocus = true
-			return m, m.jqlInput.Focus()
+		case key.Matches(msg, m.keys.Tab):
+			return m.switchTab(homeTab((int(m.tab) + 1) % len(allTabs)))
+		case key.Matches(msg, m.keys.ShiftTab):
+			return m.switchTab(homeTab((int(m.tab) + len(allTabs) - 1) % len(allTabs)))
+		case key.Matches(msg, m.keys.Dashboard):
+			return m.switchTab(tabDashboard)
 		case key.Matches(msg, m.keys.Boards):
-			m.action = &HomeAction{Kind: "boards"}
-			return m, tea.Quit
-		case key.Matches(msg, m.keys.Refresh):
-			m.loading = len(m.sections)
-			cmds := []tea.Cmd{m.spinner.Tick}
-			loaders := []func(int) ([]api.Issue, error){
-				m.svc.ListMyAssigned, m.svc.ListMentioned,
-				m.svc.ListWatching, m.svc.ListCurrentSprint,
-			}
-			for i := range m.sections {
-				if i < len(loaders) {
-					m.sections[i].loaded = false
-					m.sections[i].chip = "loading…"
-					cmds = append(cmds, m.fetchSection(i, loaders[i]))
-				}
-			}
-			return m, tea.Batch(cmds...)
-		case key.Matches(msg, m.keys.Open):
-			if iss, ok := m.issueAtCursor(); ok {
-				_ = openInBrowser(iss.WebURL)
-			}
-			return m, nil
-		case key.Matches(msg, m.keys.Enter):
-			if iss, ok := m.issueAtCursor(); ok {
-				_ = config.AddRecent(m.svc.Host(), iss.Key, iss.Summary)
-				m.action = &HomeAction{Kind: "issue", Key: iss.Key}
-				return m, tea.Quit
-			}
-			return m, nil
+			return m.switchTab(tabBoards)
+		}
+
+		// Tab-specific keys.
+		switch m.tab {
+		case tabDashboard:
+			return m.updateDashboardKey(msg)
+		case tabBoards:
+			return m.updateBoardsKey(msg)
 		}
 	}
 	return m, nil
+}
+
+// switchTab flips to the requested tab, lazy-loading boards on first
+// open. Re-renders the body so the new tab is visible immediately.
+func (m homeModel) switchTab(t homeTab) (tea.Model, tea.Cmd) {
+	m.tab = t
+	m.vp.SetContent(m.renderBody())
+	m.vp.GotoTop()
+	if t == tabBoards && !m.boardsLoaded && !m.boardsLoading {
+		m.boardsLoading = true
+		return m, tea.Batch(m.spinner.Tick, m.fetchBoards())
+	}
+	return m, nil
+}
+
+func (m homeModel) updateJQLFocused(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.jqlFocus = false
+		m.jqlInput.Blur()
+		return m, nil
+	case "enter":
+		jql := strings.TrimSpace(m.jqlInput.Value())
+		if jql == "" {
+			return m, nil
+		}
+		m.loading = 1
+		m.jqlFocus = false
+		m.jqlInput.Blur()
+		return m, tea.Batch(m.spinner.Tick, m.runSearch(jql))
+	}
+	var cmd tea.Cmd
+	m.jqlInput, cmd = m.jqlInput.Update(msg)
+	return m, cmd
+}
+
+func (m homeModel) updateBoardsFilterFocused(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "enter":
+		m.boardsFocus = false
+		m.boardsFilter.Blur()
+		m.applyBoardsFilter()
+		m.boardCursor = 0
+		m.vp.SetContent(m.renderBody())
+		m.vp.GotoTop()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.boardsFilter, cmd = m.boardsFilter.Update(msg)
+	// Live-filter as the user types so the list narrows immediately.
+	m.applyBoardsFilter()
+	if m.boardCursor >= len(m.boardsFiltered) {
+		m.boardCursor = 0
+	}
+	m.vp.SetContent(m.renderBody())
+	return m, cmd
+}
+
+func (m homeModel) updateDashboardKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, m.keys.Up):
+		m.moveCursor(-1)
+		m.vp.SetContent(m.renderBody())
+		m.snapViewportToCursor()
+	case key.Matches(msg, m.keys.Down):
+		m.moveCursor(1)
+		m.vp.SetContent(m.renderBody())
+		m.snapViewportToCursor()
+	case key.Matches(msg, m.keys.PageUp):
+		m.vp.ViewUp()
+	case key.Matches(msg, m.keys.PageDown):
+		m.vp.ViewDown()
+	case key.Matches(msg, m.keys.Top):
+		m.cursor = 0
+		m.vp.SetContent(m.renderBody())
+		m.vp.GotoTop()
+	case key.Matches(msg, m.keys.Bottom):
+		if n := m.cursorRowCount(); n > 0 {
+			m.cursor = n - 1
+		}
+		m.vp.SetContent(m.renderBody())
+		m.vp.GotoBottom()
+	case key.Matches(msg, m.keys.HalfDown):
+		m.vp.HalfViewDown()
+	case key.Matches(msg, m.keys.HalfUp):
+		m.vp.HalfViewUp()
+	case key.Matches(msg, m.keys.JQL):
+		m.jqlFocus = true
+		return m, m.jqlInput.Focus()
+	case key.Matches(msg, m.keys.Refresh):
+		m.loading = len(m.sections)
+		cmds := []tea.Cmd{m.spinner.Tick}
+		loaders := []func(int) ([]api.Issue, error){
+			m.svc.ListMyAssigned, m.svc.ListMentioned,
+			m.svc.ListWatching, m.svc.ListCurrentSprint,
+		}
+		for i := range m.sections {
+			if i < len(loaders) {
+				m.sections[i].loaded = false
+				m.sections[i].chip = "loading…"
+				cmds = append(cmds, m.fetchSection(i, loaders[i]))
+			}
+		}
+		return m, tea.Batch(cmds...)
+	case key.Matches(msg, m.keys.Open):
+		if iss, ok := m.issueAtCursor(); ok {
+			_ = openInBrowser(iss.WebURL)
+		}
+	case key.Matches(msg, m.keys.Enter):
+		if iss, ok := m.issueAtCursor(); ok {
+			_ = config.AddRecent(m.svc.Host(), iss.Key, iss.Summary)
+			m.action = &HomeAction{Kind: "issue", Key: iss.Key}
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m homeModel) updateBoardsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch {
+	case key.Matches(msg, m.keys.Up):
+		if m.boardCursor > 0 {
+			m.boardCursor--
+		}
+		m.vp.SetContent(m.renderBody())
+	case key.Matches(msg, m.keys.Down):
+		if m.boardCursor < len(m.boardsFiltered)-1 {
+			m.boardCursor++
+		}
+		m.vp.SetContent(m.renderBody())
+	case key.Matches(msg, m.keys.Top):
+		m.boardCursor = 0
+		m.vp.SetContent(m.renderBody())
+		m.vp.GotoTop()
+	case key.Matches(msg, m.keys.Bottom):
+		if n := len(m.boardsFiltered); n > 0 {
+			m.boardCursor = n - 1
+		}
+		m.vp.SetContent(m.renderBody())
+		m.vp.GotoBottom()
+	case key.Matches(msg, m.keys.PageDown):
+		m.vp.ViewDown()
+	case key.Matches(msg, m.keys.PageUp):
+		m.vp.ViewUp()
+	case key.Matches(msg, m.keys.HalfDown):
+		m.vp.HalfViewDown()
+	case key.Matches(msg, m.keys.HalfUp):
+		m.vp.HalfViewUp()
+	case key.Matches(msg, m.keys.JQL):
+		// '/' opens the boards filter when on the Boards tab.
+		m.boardsFocus = true
+		return m, m.boardsFilter.Focus()
+	case key.Matches(msg, m.keys.Refresh):
+		m.boardsLoading = true
+		m.boardsLoaded = false
+		return m, tea.Batch(m.spinner.Tick, m.fetchBoards())
+	case key.Matches(msg, m.keys.Enter):
+		if b, ok := m.boardAtCursor(); ok {
+			m.action = &HomeAction{Kind: "board", BoardID: b.ID}
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+// applyBoardsFilter recomputes boardsFiltered using the textinput
+// value. Filter terms are case-insensitive substrings checked
+// against project key, board type and name.
+func (m *homeModel) applyBoardsFilter() {
+	q := strings.ToLower(strings.TrimSpace(m.boardsFilter.Value()))
+	if q == "" {
+		m.boardsFiltered = m.boards
+		return
+	}
+	out := make([]api.Board, 0, len(m.boards))
+	for _, b := range m.boards {
+		hay := strings.ToLower(b.ProjectKey + " " + b.Type + " " + b.Name)
+		if strings.Contains(hay, q) {
+			out = append(out, b)
+		}
+	}
+	m.boardsFiltered = out
+}
+
+func (m homeModel) boardAtCursor() (api.Board, bool) {
+	if m.boardCursor < 0 || m.boardCursor >= len(m.boardsFiltered) {
+		return api.Board{}, false
+	}
+	return m.boardsFiltered[m.boardCursor], true
 }
 
 // cursorLine returns the y-coordinate (in lines from the top of the
@@ -423,7 +626,7 @@ func (m homeModel) issueAtCursor() (api.Issue, bool) {
 // ---------- view ----------
 
 func (m *homeModel) layout() {
-	headerH := 4 // title + JQL bar + spacing
+	headerH := 5 // title + tab strip + sub-bar + spacing
 	footerH := 1
 	w := m.width
 	if w < 30 {
@@ -436,20 +639,49 @@ func (m *homeModel) layout() {
 	m.vp.Width = w
 	m.vp.Height = bodyH
 	m.jqlInput.Width = w - 8
+	m.boardsFilter.Width = w - 12
+}
+
+// tab strip styles — the active tab gets the indigo badge, others a
+// dim muted look. Mirrors bb's titleBadge / paneMutedStyle pairing.
+var (
+	tabActiveStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("57")).Padding(0, 1)
+	tabInactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Padding(0, 1)
+)
+
+func (m homeModel) renderTabStrip() string {
+	parts := make([]string, 0, len(allTabs))
+	for _, t := range allTabs {
+		label := fmt.Sprintf("[%s] %s", tabHotkey(t), t.name())
+		if t == m.tab {
+			parts = append(parts, tabActiveStyle.Render(label))
+		} else {
+			parts = append(parts, tabInactiveStyle.Render(label))
+		}
+	}
+	hint := paneMutedStyle.Render("  · tab/⇧tab to switch")
+	return strings.Join(parts, " ") + hint
+}
+
+// tabHotkey returns the single-letter shortcut for a tab.
+func tabHotkey(t homeTab) string {
+	switch t {
+	case tabDashboard:
+		return "d"
+	case tabBoards:
+		return "b"
+	}
+	return "?"
 }
 
 func (m homeModel) View() string {
 	header := titleBar("JIRA · "+m.svc.Host(), titleChip.Render(m.svc.Me()))
-	jql := m.jqlInput.View()
-	if !m.jqlFocus {
-		jql = paneMutedStyle.Render("type / to enter JQL · enter to run · esc to cancel")
-		if v := m.jqlInput.Value(); v != "" {
-			jql = paneMutedStyle.Render("filter: " + v + "   (/ to edit, ctrl-u to clear)")
-		}
-	}
+	tabs := m.renderTabStrip()
+	subBar := m.renderSubBar()
+
 	help := m.help.View(m.keys)
 	status := ""
-	if m.loading > 0 {
+	if m.loading > 0 || m.boardsLoading {
 		status = paneMutedStyle.Render(m.spinner.View() + " loading…")
 	} else if m.status != "" {
 		status = paneMutedStyle.Render(m.status)
@@ -460,11 +692,49 @@ func (m homeModel) View() string {
 	if status != "" {
 		footer = status + "   " + footer
 	}
-	return strings.Join([]string{header, jql, "", body, footer}, "\n")
+	return strings.Join([]string{header, tabs, subBar, "", body, footer}, "\n")
 }
 
-// renderBody composes the section list with the current cursor mark.
+// renderSubBar renders the per-tab control row that sits between the
+// tab strip and the body — the JQL prompt for Dashboard, the board
+// filter for Boards.
+func (m homeModel) renderSubBar() string {
+	switch m.tab {
+	case tabDashboard:
+		if m.jqlFocus {
+			return m.jqlInput.View()
+		}
+		if v := m.jqlInput.Value(); v != "" {
+			return paneMutedStyle.Render("filter: " + v + "   (/ to edit, ctrl-u to clear)")
+		}
+		return paneMutedStyle.Render("type / to enter JQL · enter to run · esc to cancel")
+	case tabBoards:
+		if m.boardsFocus {
+			return m.boardsFilter.View()
+		}
+		count := paneMutedStyle.Render(fmt.Sprintf("%d / %d boards", len(m.boardsFiltered), len(m.boards)))
+		hint := paneMutedStyle.Render("   /  filter · enter open · r refresh")
+		if v := m.boardsFilter.Value(); v != "" {
+			return paneMutedStyle.Render("filter: "+v+"   ") + count + hint
+		}
+		return count + hint
+	}
+	return ""
+}
+
+// renderBody dispatches to the right per-tab renderer.
 func (m homeModel) renderBody() string {
+	switch m.tab {
+	case tabDashboard:
+		return m.renderDashboard()
+	case tabBoards:
+		return m.renderBoards()
+	}
+	return ""
+}
+
+// renderDashboard composes the section list with the current cursor.
+func (m homeModel) renderDashboard() string {
 	var b strings.Builder
 	idx := 0
 	for _, s := range m.sections {
@@ -501,6 +771,50 @@ func (m homeModel) renderBody() string {
 			b.WriteByte('\n')
 			idx++
 		}
+	}
+	return b.String()
+}
+
+// renderBoards lists every board (post-filter) with the current
+// cursor mark. Empty / loading states get their own card.
+func (m homeModel) renderBoards() string {
+	if !m.boardsLoaded && !m.boardsLoading {
+		return paneMutedStyle.Render("press enter or wait — boards will load automatically")
+	}
+	if m.boardsLoading && len(m.boards) == 0 {
+		return paneMutedStyle.Render("loading boards…")
+	}
+	if len(m.boards) == 0 {
+		return paneMutedStyle.Render("no boards available — is the Jira Agile / Software addon installed?")
+	}
+	if len(m.boardsFiltered) == 0 {
+		return paneMutedStyle.Render(fmt.Sprintf("no boards match filter %q", m.boardsFilter.Value()))
+	}
+
+	var b strings.Builder
+	idStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	typeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	projStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	selStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15"))
+	pointerSel := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("11")).Render("▶ ")
+	for i, brd := range m.boardsFiltered {
+		pointer := "  "
+		nameStyle := lipgloss.NewStyle()
+		if i == m.boardCursor {
+			pointer = pointerSel
+			nameStyle = selStyle
+		}
+		proj := brd.ProjectKey
+		if proj == "" {
+			proj = "—"
+		}
+		fmt.Fprintf(&b, "%s%s  %s  %s  %s\n",
+			pointer,
+			idStyle.Render(padRight(fmt.Sprintf("#%d", brd.ID), 7)),
+			typeStyle.Render(padRight(brd.Type, 7)),
+			projStyle.Render(padRight(proj, 10)),
+			nameStyle.Render(brd.Name),
+		)
 	}
 	return b.String()
 }
@@ -544,37 +858,42 @@ type homeKeys struct {
 	HalfUp, HalfDown           key.Binding
 	Top, Bottom                key.Binding
 	Enter, Open                key.Binding
-	Boards                     key.Binding
+	Tab, ShiftTab              key.Binding
+	Dashboard, Boards          key.Binding
 	Refresh, JQL               key.Binding
 	Help, Quit                 key.Binding
 }
 
 func defaultHomeKeys() homeKeys {
 	return homeKeys{
-		Up:       key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
-		Down:     key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
-		PageUp:   key.NewBinding(key.WithKeys("pgup", "b"), key.WithHelp("pgup", "page up")),
-		PageDown: key.NewBinding(key.WithKeys("pgdown", " ", "f"), key.WithHelp("pgdn", "page down")),
-		HalfUp:   key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("^u", "½ page up")),
-		HalfDown: key.NewBinding(key.WithKeys("ctrl+d"), key.WithHelp("^d", "½ page down")),
-		Top:      key.NewBinding(key.WithKeys("g", "home"), key.WithHelp("g", "top")),
-		Bottom:   key.NewBinding(key.WithKeys("G", "end"), key.WithHelp("G", "bottom")),
-		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
-		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
-		Boards:   key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "boards")),
-		Refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		JQL:      key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "JQL search")),
-		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
-		Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+		Up:        key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+		Down:      key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+		PageUp:    key.NewBinding(key.WithKeys("pgup"), key.WithHelp("pgup", "page up")),
+		PageDown:  key.NewBinding(key.WithKeys("pgdown", " "), key.WithHelp("pgdn", "page down")),
+		HalfUp:    key.NewBinding(key.WithKeys("ctrl+u"), key.WithHelp("^u", "½ page up")),
+		HalfDown:  key.NewBinding(key.WithKeys("ctrl+d"), key.WithHelp("^d", "½ page down")),
+		Top:       key.NewBinding(key.WithKeys("g", "home"), key.WithHelp("g", "top")),
+		Bottom:    key.NewBinding(key.WithKeys("G", "end"), key.WithHelp("G", "bottom")),
+		Enter:     key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open")),
+		Open:      key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
+		Tab:       key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "next tab")),
+		ShiftTab:  key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("⇧tab", "prev tab")),
+		Dashboard: key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "Dashboard")),
+		Boards:    key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "Boards")),
+		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		JQL:       key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
+		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
 }
 
 func (k homeKeys) ShortHelp() []key.Binding {
-	return []key.Binding{k.Up, k.Down, k.Enter, k.Open, k.Boards, k.JQL, k.Refresh, k.Quit}
+	return []key.Binding{k.Up, k.Down, k.Enter, k.Tab, k.Dashboard, k.Boards, k.JQL, k.Refresh, k.Quit}
 }
 func (k homeKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.HalfUp, k.HalfDown, k.Top, k.Bottom},
-		{k.Enter, k.Open, k.Boards, k.JQL, k.Refresh, k.Help, k.Quit},
+		{k.Tab, k.ShiftTab, k.Dashboard, k.Boards, k.JQL, k.Refresh},
+		{k.Enter, k.Open, k.Help, k.Quit},
 	}
 }
