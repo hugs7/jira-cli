@@ -62,6 +62,14 @@ type Service interface {
 	// /rest/api/2/field on first use and cache it.
 	UpdateStoryPoints(key string, points float64) error
 
+	// ListWatchers returns the users currently watching the issue.
+	ListWatchers(key string) ([]User, error)
+	// AddWatcher adds username/accountID to the issue's watcher list.
+	// Empty user adds the authenticated user (matches Jira default).
+	AddWatcher(key, user string) error
+	// RemoveWatcher removes username/accountID from the watcher list.
+	RemoveWatcher(key, user string) error
+
 	// Catalogue endpoints used to populate static pickers.
 	ListPriorities() ([]NamedItem, error)
 	ListIssueTypes(projectKey string) ([]NamedItem, error)

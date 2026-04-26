@@ -24,6 +24,8 @@ type Issue struct {
 	Sprint      string // active sprint name (best-effort)
 	StoryPoints float64
 	DueDate     string // ISO-8601 date (YYYY-MM-DD); "" if unset
+	Watching    bool   // true if the current user is on the watcher list
+	WatchCount  int    // total watcher count (independent of Watching)
 	ParentKey   string // for sub-tasks / stories under epics
 	EpicKey     string // for issues in an epic
 	WebURL      string

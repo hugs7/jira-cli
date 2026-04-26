@@ -93,6 +93,9 @@ func (c *cloudService) ListLinks(key string) ([]IssueLink, error)    { return ni
 func (c *cloudService) ListIssueLinkTypes() ([]IssueLinkType, error) { return nil, errCloudTodo }
 func (c *cloudService) AddIssueLink(from, to, typ, dir string) error { return errCloudTodo }
 func (c *cloudService) DeleteIssueLink(id string) error              { return errCloudTodo }
+func (c *cloudService) ListWatchers(key string) ([]User, error)      { return nil, errCloudTodo }
+func (c *cloudService) AddWatcher(key, user string) error            { return errCloudTodo }
+func (c *cloudService) RemoveWatcher(key, user string) error         { return errCloudTodo }
 func (c *cloudService) ListProjects() ([]Project, error)             { return nil, errCloudTodo }
 func (c *cloudService) ListMyAssigned(max int) ([]Issue, error)      { return []Issue{}, nil }
 func (c *cloudService) ListMentioned(max int) ([]Issue, error)       { return []Issue{}, nil }

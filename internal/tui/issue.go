@@ -278,6 +278,14 @@ func (m issueModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case watchersForPickerMsg:
+		m.dec()
+		if msg.err != nil {
+			m.status = "✗ load watchers: " + msg.err.Error()
+			return m, nil
+		}
+		return m, m.showWatchersPicker(msg.current)
+
 	case pickerLoadedMsg, pickerTickMsg:
 		if m.picker == nil {
 			return m, nil
@@ -409,6 +417,10 @@ func (m issueModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.openStoryPointsPicker()
 	case key.Matches(msg, m.keys.AddLink):
 		return m, m.openLinkTypePicker()
+	case key.Matches(msg, m.keys.ToggleWatch):
+		return m, m.toggleWatchCmd()
+	case key.Matches(msg, m.keys.EditWatchers):
+		return m, m.openWatchersPicker()
 	case key.Matches(msg, m.keys.Unassign):
 		m.loading++
 		return m, tea.Batch(m.spinner.Tick, m.runAction("unassigned", "issue", func() error {
@@ -704,6 +716,16 @@ func (m issueModel) renderHeader() string {
 	}
 	if m.issue.Assignee != "" {
 		chips = append(chips, titleChipDim.Render("@"+m.issue.Assignee))
+	}
+	if m.issue.WatchCount > 0 || m.issue.Watching {
+		eye := "👁"
+		if m.issue.Watching {
+			chips = append(chips, lipgloss.NewStyle().
+				Foreground(lipgloss.Color("159")).
+				Render(fmt.Sprintf("%s %d", eye, m.issue.WatchCount)))
+		} else {
+			chips = append(chips, titleChipDim.Render(fmt.Sprintf("%s %d", eye, m.issue.WatchCount)))
+		}
 	}
 	header := titleBar(m.key+"  "+m.issue.Summary, chips...)
 	return header
@@ -1219,6 +1241,110 @@ func (m *issueModel) openLinkTargetPicker() tea.Cmd {
 	return p.Init()
 }
 
+// watchersForPickerMsg carries the result of the pre-fetch
+// openWatchersPicker fires before constructing its multi-select
+// picker. The current watcher list isn't on the loaded Issue (only
+// Watching + WatchCount are), so we have to round-trip the API
+// before we can preselect rows.
+type watchersForPickerMsg struct {
+	current []api.User
+	err     error
+}
+
+// openWatchersPicker pre-fetches the issue's current watchers,
+// then (in Update → showWatchersPicker) constructs a multi-select
+// user picker with those watchers preselected. Returning the
+// fetch as a Cmd keeps the UI responsive while the API call is
+// in flight.
+func (m *issueModel) openWatchersPicker() tea.Cmd {
+	if m.issue == nil {
+		return nil
+	}
+	key := m.key
+	svc := m.svc
+	m.loading++
+	return tea.Batch(m.spinner.Tick, func() tea.Msg {
+		users, err := svc.ListWatchers(key)
+		return watchersForPickerMsg{current: users, err: err}
+	})
+}
+
+// showWatchersPicker constructs the watchers multi-select picker
+// with the supplied current set preselected. Items are looked up
+// async via SearchUsers as the user types; the current watchers
+// are seeded into every result page so they remain de-selectable
+// even when the search wouldn't otherwise return them.
+func (m *issueModel) showWatchersPicker(current []api.User) tea.Cmd {
+	userValue := func(u api.User) string {
+		if u.AccountID != "" {
+			return u.AccountID
+		}
+		return u.Name
+	}
+	pre := []any{}
+	seedItems := make([]PickerItem, 0, len(current))
+	for _, u := range current {
+		v := userValue(u)
+		if v == "" {
+			continue
+		}
+		pre = append(pre, v)
+		seedItems = append(seedItems, PickerItem{
+			Label: u.DisplayName,
+			Sub:   strings.TrimSpace(u.Name + "  " + u.Email),
+			Value: v,
+		})
+	}
+	svc := m.svc
+	loader := func(query string, token int) tea.Cmd {
+		return func() tea.Msg {
+			users, err := svc.SearchUsers(query, 25)
+			items := append([]PickerItem(nil), seedItems...)
+			seen := map[string]bool{}
+			for _, it := range items {
+				seen[fmt.Sprint(it.Value)] = true
+			}
+			for _, u := range users {
+				v := userValue(u)
+				if v == "" || seen[v] {
+					continue
+				}
+				seen[v] = true
+				items = append(items, PickerItem{
+					Label: u.DisplayName,
+					Sub:   strings.TrimSpace(u.Name + "  " + u.Email),
+					Value: v,
+				})
+			}
+			return pickerLoadedMsg{Token: token, Items: items, Err: err}
+		}
+	}
+	p := NewAsyncPicker("watchers", "Watchers for "+m.key, "type to find users…", loader)
+	p.SetSize(m.width, m.height)
+	p.EnableMultiSelect(pre)
+	m.modeReturn = m.mode
+	m.mode = modePicker
+	m.picker = p
+	return p.Init()
+}
+
+// toggleWatchCmd flips the current user's watch state on this
+// issue. Reloads the issue afterwards so the eye chip updates.
+func (m *issueModel) toggleWatchCmd() tea.Cmd {
+	if m.issue == nil {
+		return nil
+	}
+	m.loading++
+	if m.issue.Watching {
+		return tea.Batch(m.spinner.Tick, m.runAction("unwatched", "issue", func() error {
+			return m.svc.RemoveWatcher(m.key, "")
+		}))
+	}
+	return tea.Batch(m.spinner.Tick, m.runAction("watching", "issue", func() error {
+		return m.svc.AddWatcher(m.key, "")
+	}))
+}
+
 // looksLikeIssueKey returns true for strings that match the canonical
 // PROJ-123 form. We use it to short-circuit JQL "summary ~ ..." into
 // the much faster "key = PROJ-123" lookup.
@@ -1337,6 +1463,53 @@ func (m *issueModel) applyPicker(msg pickerDoneMsg) (tea.Model, tea.Cmd) {
 			fmt.Sprintf("story points → %g", points), "issue", func() error {
 				return m.svc.UpdateStoryPoints(m.key, points)
 			}))
+	case "watchers":
+		desired := stringSliceFromAny(msg.Values)
+		key := m.key
+		svc := m.svc
+		m.loading++
+		return m, tea.Batch(m.spinner.Tick, m.runAction(
+			fmt.Sprintf("watchers updated (%d)", len(desired)), "issue", func() error {
+				// Re-fetch the current set inside the action so the
+				// diff is computed against fresh server-side state
+				// (rather than the snapshot taken when the picker
+				// opened, which could be stale by now).
+				current, err := svc.ListWatchers(key)
+				if err != nil {
+					return err
+				}
+				userValue := func(u api.User) string {
+					if u.AccountID != "" {
+						return u.AccountID
+					}
+					return u.Name
+				}
+				currentSet := map[string]bool{}
+				for _, u := range current {
+					if v := userValue(u); v != "" {
+						currentSet[v] = true
+					}
+				}
+				desiredSet := map[string]bool{}
+				for _, v := range desired {
+					desiredSet[v] = true
+				}
+				for v := range desiredSet {
+					if !currentSet[v] {
+						if err := svc.AddWatcher(key, v); err != nil {
+							return err
+						}
+					}
+				}
+				for v := range currentSet {
+					if !desiredSet[v] {
+						if err := svc.RemoveWatcher(key, v); err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}))
 	case "linktype":
 		pl, ok := msg.Value.(pendingLink)
 		if !ok {
@@ -1400,6 +1573,7 @@ type issueKeys struct {
 	EditLabels, EditComponents                            key.Binding
 	EditFixVersions, EditDueDate, EditStoryPoints         key.Binding
 	AddLink, RemoveLink                                   key.Binding
+	ToggleWatch, EditWatchers                             key.Binding
 	EditComment, DeleteComment, ConfirmYes, ConfirmNo     key.Binding
 }
 
@@ -1433,6 +1607,8 @@ func defaultIssueKeys() issueKeys {
 		EditStoryPoints: key.NewBinding(key.WithKeys("#"), key.WithHelp("#", "story points…")),
 		AddLink:         key.NewBinding(key.WithKeys("K"), key.WithHelp("K", "add link…")),
 		RemoveLink:      key.NewBinding(key.WithKeys("X"), key.WithHelp("X", "remove link")),
+		ToggleWatch:     key.NewBinding(key.WithKeys("w"), key.WithHelp("w", "watch toggle")),
+		EditWatchers:    key.NewBinding(key.WithKeys("W"), key.WithHelp("W", "watchers…")),
 		NewComment:      key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "new comment")),
 		EditComment:     key.NewBinding(key.WithKeys("E"), key.WithHelp("E", "edit comment")),
 		DeleteComment:   key.NewBinding(key.WithKeys("D"), key.WithHelp("D", "delete comment")),
@@ -1452,7 +1628,7 @@ func (k issueKeys) FullHelp() [][]key.Binding {
 		{k.AssignMe, k.AssignPick, k.Unassign, k.EditSummary, k.EditDescription, k.OpenBrowser},
 		{k.PickPriority, k.PickType, k.PickSprint, k.EditLabels, k.EditComponents},
 		{k.EditFixVersions, k.EditDueDate, k.EditStoryPoints},
-		{k.AddLink, k.RemoveLink},
+		{k.AddLink, k.RemoveLink, k.ToggleWatch, k.EditWatchers},
 		{k.NewComment, k.EditComment, k.DeleteComment},
 		{k.Up, k.Down, k.Enter, k.Help, k.Back, k.Quit},
 	}

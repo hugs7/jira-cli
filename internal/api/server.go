@@ -61,6 +61,10 @@ type srvFields struct {
 	Components []srvNamed `json:"components"`
 	FixVersions []srvNamed `json:"fixVersions"`
 	DueDate    string `json:"duedate"`
+	Watches    *struct {
+		WatchCount int  `json:"watchCount"`
+		IsWatching bool `json:"isWatching"`
+	} `json:"watches"`
 	Created    string `json:"created"`
 	Updated    string `json:"updated"`
 	Parent     *struct {
@@ -190,6 +194,10 @@ func (s *serverService) toIssue(in srvIssue) Issue {
 		out.FixVersions = append(out.FixVersions, v.Name)
 	}
 	out.DueDate = in.Fields.DueDate
+	if in.Fields.Watches != nil {
+		out.Watching = in.Fields.Watches.IsWatching
+		out.WatchCount = in.Fields.Watches.WatchCount
+	}
 	if in.Fields.Parent != nil {
 		out.ParentKey = in.Fields.Parent.Key
 		// Server marks epics by issuetype name "Epic"; if the parent
@@ -755,6 +763,45 @@ func (s *serverService) AddIssueLink(fromKey, toKey, typeName, direction string)
 // DeleteIssueLink calls DELETE /issueLink/{id}.
 func (s *serverService) DeleteIssueLink(linkID string) error {
 	return s.client.deleteJSON("issueLink/" + linkID)
+}
+
+// ListWatchers fetches the watcher list for an issue. Server returns
+// the list inline at /issue/{key}/watchers.
+func (s *serverService) ListWatchers(key string) ([]User, error) {
+	var raw struct {
+		Watchers []srvUser `json:"watchers"`
+	}
+	if err := s.client.getJSON("issue/"+key+"/watchers", &raw); err != nil {
+		return nil, err
+	}
+	out := make([]User, 0, len(raw.Watchers))
+	for _, u := range raw.Watchers {
+		out = append(out, User{
+			Name: u.Name, DisplayName: u.DisplayName, Email: u.EmailAddress,
+		})
+	}
+	return out, nil
+}
+
+// AddWatcher posts a raw JSON-string username to /issue/{key}/watchers.
+// Empty user falls through as Jira's "add me" semantics.
+func (s *serverService) AddWatcher(key, user string) error {
+	if user == "" {
+		user = s.client.cfg.Username
+	}
+	// Jira expects a JSON-encoded string literal in the body, e.g.
+	// `"johndoe"` — not an object. Use postJSON's marshalling so we
+	// get correct quoting + content-type for free.
+	return s.client.postJSON("issue/"+key+"/watchers", user, nil)
+}
+
+// RemoveWatcher calls DELETE /issue/{key}/watchers?username=...
+func (s *serverService) RemoveWatcher(key, user string) error {
+	if user == "" {
+		user = s.client.cfg.Username
+	}
+	endpoint := "issue/" + key + "/watchers" + queryString(map[string]string{"username": user})
+	return s.client.deleteJSON(endpoint)
 }
 
 func (s *serverService) ListProjects() ([]Project, error) {
