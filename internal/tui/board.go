@@ -69,7 +69,8 @@ type boardModel struct {
 	keys    boardKeys
 	action  *BoardAction
 
-	vp viewport.Model // body scroll for tall columns
+	vp        viewport.Model // body scroll for tall columns
+	headerRow string         // sticky column-header strip rendered above vp
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
@@ -141,6 +142,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
+		m.composeBody()
 		return m, nil
 
 	case tea.MouseMsg:
@@ -167,6 +169,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loading > 0 {
 			m.loading--
 		}
+		m.composeBody()
 		// Now that we know the columns, kick off issues load too.
 		m.loading++
 		return m, m.fetchIssues()
@@ -192,6 +195,8 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading--
 		}
 		m.clampCursor()
+		m.composeBody()
+		m.snapVP()
 		return m, nil
 
 	case tea.KeyMsg:
@@ -200,23 +205,29 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.Left):
 			m.moveCol(-1)
+			m.composeBody()
 			m.snapVP()
 		case key.Matches(msg, m.keys.Right):
 			m.moveCol(1)
+			m.composeBody()
 			m.snapVP()
 		case key.Matches(msg, m.keys.Up):
 			m.moveRow(-1)
+			m.composeBody()
 			m.snapVP()
 		case key.Matches(msg, m.keys.Down):
 			m.moveRow(1)
+			m.composeBody()
 			m.snapVP()
 		case key.Matches(msg, m.keys.Top):
 			m.rowCursor = 0
+			m.composeBody()
 			m.vp.GotoTop()
 		case key.Matches(msg, m.keys.Bottom):
 			if n := len(m.currentColIssues()); n > 0 {
 				m.rowCursor = n - 1
 			}
+			m.composeBody()
 			m.snapVP()
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
@@ -407,10 +418,12 @@ func (m *boardModel) cardWidth() int {
 }
 
 var (
+	// Padding(0, 2) so header text starts at the same column as the
+	// card body (1 char card border + 1 char card padding = 2).
 	colHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).
-			Background(lipgloss.Color("57")).Padding(0, 1)
+			Background(lipgloss.Color("57")).Padding(0, 2)
 	colHeaderDim = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("245")).
-			Padding(0, 1)
+			Padding(0, 2)
 	cardBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("238")).Padding(0, 1).Margin(0, 0, 1, 0)
 	cardSel = lipgloss.NewStyle().Border(lipgloss.ThickBorder()).
@@ -425,7 +438,7 @@ func (m boardModel) View() string {
 		return paneMutedStyle.Render(m.spinner.View() + " loading board…")
 	}
 
-	// --- header ---
+	// --- title bar ---
 	chips := []string{}
 	if m.cfg.Board.ProjectKey != "" {
 		chips = append(chips, titleChip.Render(m.cfg.Board.ProjectKey))
@@ -448,38 +461,30 @@ func (m boardModel) View() string {
 	}
 	header := titleBar("BOARD · "+m.cfg.Board.Name, chips...)
 
-	// --- columns ---
+	// --- footer ---
 	visible := m.visibleColumns()
-	cw := m.cardWidth()
 	from := m.colOffset
 	to := from + visible
 	if to > len(m.grouped) {
 		to = len(m.grouped)
 	}
-
-	cols := make([]string, 0, to-from)
-	for ci := from; ci < to; ci++ {
-		cols = append(cols, m.renderColumn(ci, cw))
-	}
-	body := lipgloss.JoinHorizontal(lipgloss.Top, cols...)
-	m.vp.SetContent(body)
-
-	// --- footer ---
 	scrollHint := ""
 	if len(m.grouped) > visible {
 		scrollHint = paneMutedStyle.Render(
 			fmt.Sprintf("  cols %d-%d of %d (h/l to scroll)", from+1, to, len(m.grouped)))
 	}
 	help := m.help.View(m.keys)
-	return strings.Join([]string{header, "", m.vp.View(), help + scrollHint}, "\n")
+	return strings.Join([]string{header, "", m.headerRow, m.vp.View(), help + scrollHint}, "\n")
 }
 
-// layout sizes the body viewport to whatever vertical room is left
-// after the header (1 line + 1 spacer) and footer (1 help line).
+// layout sizes the body viewport. The visible chrome is:
+//   - title bar          (1 line)
+//   - blank spacer       (1 line)
+//   - sticky header row  (1 line)
+//   - footer / help      (1 line)
 func (m *boardModel) layout() {
-	const headerH = 2
-	const footerH = 1
-	h := m.height - headerH - footerH
+	const chromeH = 4
+	h := m.height - chromeH
 	if h < 5 {
 		h = 5
 	}
@@ -491,14 +496,42 @@ func (m *boardModel) layout() {
 	m.vp.Height = h
 }
 
+// composeBody recomputes the sticky header strip and the cards-only
+// body, and pushes the body into the viewport. Called from every
+// Update branch that mutates the visible state.
+func (m *boardModel) composeBody() {
+	if m.cfg == nil {
+		return
+	}
+	visible := m.visibleColumns()
+	cw := m.cardWidth()
+	from := m.colOffset
+	to := from + visible
+	if to > len(m.grouped) {
+		to = len(m.grouped)
+	}
+
+	headers := make([]string, 0, to-from)
+	cards := make([]string, 0, to-from)
+	for ci := from; ci < to; ci++ {
+		headers = append(headers, m.renderColumnHeader(ci, cw))
+		cards = append(cards, m.renderColumnCards(ci, cw))
+	}
+	m.headerRow = lipgloss.JoinHorizontal(lipgloss.Top, headers...)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, cards...)
+	m.vp.SetContent(body)
+}
+
 // snapVP scrolls the viewport so the row holding the selected card
 // is visible. Card heights are constant (cardRows) so the math is
-// straightforward — no need to walk the rendered string.
+// straightforward — no need to walk the rendered string. The header
+// row is rendered above the viewport (sticky) and so doesn't enter
+// the offset calculation.
 func (m *boardModel) snapVP() {
 	if m.vp.Height == 0 {
 		return
 	}
-	top := headerRows + m.rowCursor*cardRows
+	top := m.rowCursor * cardRows
 	bottom := top + cardRows
 	off := m.vp.YOffset
 	if top < off {
@@ -521,11 +554,11 @@ const summaryLines = 2
 // + summaryLines + 1 (meta) + 1 (margin). Used by snap-to-cursor.
 const cardRows = 2 + 1 + summaryLines + 1 + 1
 
-// headerRows is the rendered height of a column header (always 1
-// line because we truncate the header text to fit).
-const headerRows = 1
-
-func (m *boardModel) renderColumn(idx, width int) string {
+// renderColumnHeader returns just the column header line (sticky;
+// rendered above the viewport so it doesn't scroll away). Padding is
+// (0,2) so the header text starts at the same column as the card
+// body content (1 char border + 1 char card padding).
+func (m *boardModel) renderColumnHeader(idx, width int) string {
 	colName := "Other"
 	if idx < len(m.cfg.Columns) {
 		colName = m.cfg.Columns[idx].Name
@@ -536,15 +569,16 @@ func (m *boardModel) renderColumn(idx, width int) string {
 	if idx == m.colCursor {
 		headStyle = colHeaderStyle
 	}
-	// Truncate to fit *content* area (width minus 2 for the
-	// horizontal padding the style applies). Keeping the header to
-	// a single line is what stops adjacent columns "stepping down".
-	headText := truncateRunes(fmt.Sprintf("%s · %d", colName, count), width-2)
-	head := headStyle.Width(width).Render(headText)
+	// Width(width) is the rendered cell width (incl. padding); the
+	// content area inside is width - 2*padding = width - 4.
+	headText := truncateRunes(fmt.Sprintf("%s · %d", colName, count), width-4)
+	return headStyle.Width(width).Render(headText)
+}
 
+// renderColumnCards returns the cards for a column, no header. The
+// header is sticky above the viewport.
+func (m *boardModel) renderColumnCards(idx, width int) string {
 	var b strings.Builder
-	b.WriteString(head)
-	b.WriteByte('\n')
 	for ri, iss := range m.grouped[idx] {
 		selected := idx == m.colCursor && ri == m.rowCursor
 		b.WriteString(renderBoardCard(iss, width, selected))
