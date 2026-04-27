@@ -207,6 +207,39 @@ func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 	} else {
 		label = fmt.Sprintf("%d cards → %s", len(keys), colName)
 	}
+
+	// Optimistic local update: rewrite each moved issue's status
+	// to the target column's first status key, regroup, and follow
+	// the focused card to its new column position. This makes H/L
+	// feel instant — the API round-trip happens in the background
+	// and only refetches if it fails.
+	targetStatus := col.StatusKeys[0]
+	keySet := map[string]bool{}
+	for _, k := range keys {
+		keySet[k] = true
+	}
+	focusedKey := ""
+	if iss, ok := m.cardAtCursor(); ok {
+		focusedKey = iss.Key
+	}
+	for i := range m.issues {
+		if keySet[m.issues[i].Key] {
+			m.issues[i].Status = targetStatus
+		}
+	}
+	m.regroup()
+	if focusedKey != "" && keySet[focusedKey] {
+		for ri, iss := range m.grouped[target] {
+			if iss.Key == focusedKey {
+				m.colCursor = target
+				m.rowCursor = ri
+				break
+			}
+		}
+	}
+	m.snapColOffset()
+	m.composeBody()
+	m.snapVP()
 	m.loading++
 	return func() tea.Msg {
 		var firstErr error
@@ -454,18 +487,22 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status = "✗ " + msg.label + ": " + msg.err.Error()
 			m.layout()
-			m.composeBody()
-			return m, nil
+			// Refetch to roll back the optimistic local update —
+			// without this, the card would stay in its target
+			// column visually even though Jira rejected the move.
+			m.loading++
+			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
 		}
 		m.status = "✓ " + msg.label
 		// Clear the multi-select set: those cards have moved and
 		// keeping them selected on the next view is rarely useful.
 		m.selected = map[string]bool{}
 		m.layout()
-		// The card has changed status; refetch the board so the
-		// regroup picks up the new column placement.
-		m.loading++
-		return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
+		m.composeBody()
+		// No refetch on success — the optimistic update already
+		// matches what Jira now has, and skipping the round-trip
+		// is what makes successive H/L presses feel snappy.
+		return m, nil
 
 	case boardIssuesMsg:
 		m.issues = msg.issues
