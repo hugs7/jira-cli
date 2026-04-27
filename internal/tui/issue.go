@@ -18,6 +18,7 @@ import (
 
 	"github.com/hugs7/jira-cli/internal/api"
 	"github.com/hugs7/jira-cli/internal/config"
+	"github.com/hugs7/jira-cli/internal/tui/mdrender"
 )
 
 // Issue runs the interactive issue viewer for the given key. Loops
@@ -723,6 +724,12 @@ func (m *issueModel) refreshContent() {
 		desc := m.issue.Description
 		if strings.TrimSpace(desc) == "" {
 			desc = paneMutedStyle.Render("(no description)")
+		} else {
+			// Render markdown so headings, bold, lists, code blocks,
+			// and inline code show up as styled output instead of raw
+			// `*foo*` / `` `bar` `` — same treatment bb-cli uses for
+			// PR descriptions and READMEs.
+			desc = mdrender.Render(desc, m.desc.Width)
 		}
 		m.desc.SetContent(desc)
 	}
@@ -873,6 +880,15 @@ func (m issueModel) renderComments() string {
 		body := strings.TrimSpace(c.Body)
 		if body == "" {
 			body = paneMutedStyle.Render("(empty)")
+		} else {
+			// Render comment markdown (headings, bold, lists, code
+			// blocks, …). Indent width = pane width minus the 4-cell
+			// indent so wrapped lines stay inside the comment column.
+			w := m.commentsVP.Width - 4
+			if w < 20 {
+				w = 20
+			}
+			body = mdrender.Render(body, w)
 		}
 		for _, ln := range strings.Split(body, "\n") {
 			b.WriteString("    " + ln + "\n")
