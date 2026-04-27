@@ -1,0 +1,110 @@
+# GoReleaser config — produces cross-platform binaries, archives, deb/rpm
+# packages, Homebrew tap and Scoop bucket.
+# Docs: https://goreleaser.com/
+
+version: 2
+
+project_name: jr
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: jr
+    main: ./cmd/jr
+    binary: jr
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+nfpms:
+  - id: jr
+    # Long descriptive package name so `apt install jira-cli` reads
+    # naturally. Binary is still `jr` (see builds[].binary).
+    package_name: jira-cli
+    vendor: jira-cli contributors
+    homepage: https://github.com/hugs7/jira-cli
+    maintainer: jira-cli contributors
+    description: A fast, comprehensive command-line interface and TUI for Jira.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+
+# Push the .deb / .rpm / .apk files to Cloudsmith so users can install
+# and update them via apt / dnf / apk natively. Requires the
+# `cloudsmith-cli` Python package on the runner (installed in the
+# release workflow) and a CLOUDSMITH_API_KEY repo secret.
+publishers:
+  - name: cloudsmith
+    ids: [jr]
+    # GoReleaser passes every artifact in the `jr` build group to this
+    # publisher; we dispatch on the file extension in shell because
+    # the publisher template context doesn't reliably expose .Format
+    # / .Ext for all artifact types.
+    cmd: |
+      sh -c 'case "{{ .ArtifactPath }}" in
+        *.deb) exec cloudsmith push deb hugs7/jira-cli/any-distro/any-version "{{ .ArtifactPath }}" ;;
+        *.rpm) exec cloudsmith push rpm hugs7/jira-cli/any-distro/any-version "{{ .ArtifactPath }}" ;;
+        *.apk) exec cloudsmith push alpine hugs7/jira-cli/alpine/any-version "{{ .ArtifactPath }}" ;;
+        *)     echo "cloudsmith: skipping {{ .ArtifactPath }}"; exit 0 ;;
+      esac'
+    env:
+      - CLOUDSMITH_API_KEY={{ .Env.CLOUDSMITH_API_KEY }}
+
+brews:
+  # Formula name is "jira-cli" so users type
+  # `brew install hugs7/tap/jira-cli`. Installed binary is still `jr`.
+  - name: jira-cli
+    repository:
+      owner: hugs7
+      name: homebrew-tap
+    homepage: https://github.com/hugs7/jira-cli
+    description: A fast, comprehensive command-line interface and TUI for Jira.
+    license: MIT
+    test: |
+      system "#{bin}/jr version"
+
+scoops:
+  - name: jr
+    repository:
+      owner: hugs7
+      name: scoop-bucket
+    homepage: https://github.com/hugs7/jira-cli
+    description: A fast, comprehensive command-line interface and TUI for Jira.
+    license: MIT
