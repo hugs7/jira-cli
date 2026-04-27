@@ -98,6 +98,11 @@ type boardModel struct {
 	// off restores the full board without an API round-trip.
 	filterMine bool
 	filterText string
+
+	// previewOpen toggles the right-hand preview pane that shows
+	// the focused card's metadata without leaving the board. Uses
+	// only the data already on m.issues (no extra round-trip).
+	previewOpen bool
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
@@ -756,6 +761,15 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.composeBody()
 			m.snapVP()
 			return m, nil
+		case key.Matches(msg, m.keys.Preview):
+			m.previewOpen = !m.previewOpen
+			// Layout depends on previewWidth(); recompute the
+			// viewport size and re-render cards into the new
+			// boardWidth before painting.
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
 			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
@@ -949,12 +963,42 @@ const (
 	cardMaxWidth = 36
 )
 
+// previewWidth returns the right-pane width when the preview is
+// open, 0 otherwise. The pane is suppressed on terminals too narrow
+// to fit a single card next to it (under ~80 cols total) — without
+// this guard the board collapses to a useless one-column strip.
+func (m *boardModel) previewWidth() int {
+	if !m.previewOpen || m.width < 80 {
+		return 0
+	}
+	w := m.width / 3
+	if w < 32 {
+		w = 32
+	}
+	if w > 60 {
+		w = 60
+	}
+	return w
+}
+
+// boardWidth returns the columns of horizontal space the board itself
+// gets to render in (total width minus any preview pane). Used by
+// every geometry function that previously read m.width directly.
+func (m *boardModel) boardWidth() int {
+	w := m.width - m.previewWidth()
+	if w < 30 {
+		w = 30
+	}
+	return w
+}
+
 func (m *boardModel) visibleColumns() int {
-	if m.width <= 0 {
+	bw := m.boardWidth()
+	if bw <= 0 {
 		return 1
 	}
 	w := cardMinWidth + 2 // border
-	v := m.width / w
+	v := bw / w
 	if v < 1 {
 		v = 1
 	}
@@ -969,7 +1013,7 @@ func (m *boardModel) cardWidth() int {
 	if visible <= 0 {
 		return cardMinWidth
 	}
-	w := (m.width - 2*visible) / visible
+	w := (m.boardWidth() - 2*visible) / visible
 	if w < cardMinWidth {
 		w = cardMinWidth
 	}
@@ -1043,8 +1087,69 @@ func (m boardModel) View() string {
 			lipgloss.WithWhitespaceChars(" "))
 		headerRow = strings.Repeat(" ", m.width)
 	}
+
+	// --- side-by-side board + preview ---
+	if pw := m.previewWidth(); pw > 0 && m.picker == nil {
+		bw := m.boardWidth()
+		boardCol := lipgloss.JoinVertical(lipgloss.Left, headerRow, body)
+		boardCol = lipgloss.NewStyle().Width(bw).Render(boardCol)
+		preview := lipgloss.NewStyle().Width(pw).
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(lipgloss.Color("8")).
+			PaddingLeft(1).
+			Render(m.renderPreview(pw - 3))
+		split := lipgloss.JoinHorizontal(lipgloss.Top, boardCol, preview)
+		return strings.Join([]string{header, "", split, m.renderFooter()}, "\n")
+	}
+
 	// --- footer ---
 	return strings.Join([]string{header, "", headerRow, body, m.renderFooter()}, "\n")
+}
+
+// renderPreview builds the right-pane content for the focused card.
+// Uses only fields already on m.issues so it's instant on cursor
+// move (no extra round-trip); summary is wrapped to the available
+// width and the bottom suggests Enter for the full viewer.
+func (m *boardModel) renderPreview(w int) string {
+	iss, ok := m.cardAtCursor()
+	if !ok {
+		return paneMutedStyle.Render("(no card focused)")
+	}
+	if w < 16 {
+		w = 16
+	}
+	typeCol := issueTypeColor(iss.IssueType)
+	keyLine := lipgloss.NewStyle().Bold(true).Foreground(typeCol).Render(iss.Key)
+	if iss.IssueType != "" {
+		keyLine += "  " + lipgloss.NewStyle().Foreground(typeCol).Render("· "+iss.IssueType)
+	}
+	summary := wrap(iss.Summary, w, 8)
+	if summary == "" {
+		summary = paneMutedStyle.Render("(no summary)")
+	}
+	chips := []string{styleStatus(iss.StatusCat).Render(iss.Status)}
+	if iss.Priority != "" {
+		chips = append(chips, titleChipWarn.Render(iss.Priority))
+	}
+	if iss.StoryPoints > 0 {
+		chips = append(chips, titleChip.Render(fmt.Sprintf("⛶ %g", iss.StoryPoints)))
+	}
+	chipLine := strings.Join(chips, " ")
+
+	rows := []string{keyLine, "", summary, "", chipLine}
+	if iss.Assignee != "" {
+		rows = append(rows, paneMutedStyle.Render("Assignee:"), "  "+iss.Assignee)
+	} else {
+		rows = append(rows, paneMutedStyle.Render("Assignee:"), "  "+paneMutedStyle.Render("unassigned"))
+	}
+	if len(iss.Labels) > 0 {
+		rows = append(rows, "", paneMutedStyle.Render("Labels:"), "  "+strings.Join(iss.Labels, ", "))
+	}
+	if iss.ParentKey != "" {
+		rows = append(rows, "", paneMutedStyle.Render("Parent:"), "  "+iss.ParentKey)
+	}
+	rows = append(rows, "", paneMutedStyle.Render("enter → full view"))
+	return strings.Join(rows, "\n")
 }
 
 // renderFooter composes the status + help row. Used both by View
@@ -1077,7 +1182,7 @@ func (m *boardModel) renderFooter() string {
 // clipped by however many lines the chrome had grown by — pressing G
 // looked like it didn't scroll quite far enough.
 func (m *boardModel) layout() {
-	w := m.width
+	w := m.boardWidth()
 	if w < 30 {
 		w = 30
 	}
@@ -1435,6 +1540,7 @@ type boardKeys struct {
 	Create                       key.Binding // c — inline new issue
 	SelectToggle, SelectColumn   key.Binding // v / V — bulk select
 	FilterMine, FilterText, FilterClear key.Binding // m / / / M — quick filters
+	Preview                      key.Binding // i — toggle side preview
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
 	Help, Quit                   key.Binding
@@ -1462,6 +1568,7 @@ func defaultBoardKeys() boardKeys {
 		FilterMine:   key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "mine only")),
 		FilterText:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter…")),
 		FilterClear:  key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "clear filters")),
+		Preview:      key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "preview pane")),
 		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
@@ -1479,7 +1586,7 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom, k.FirstCol, k.LastCol},
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
 		{k.MoveLeft, k.MoveRight, k.Create, k.SelectToggle, k.SelectColumn},
-		{k.FilterMine, k.FilterText, k.FilterClear},
+		{k.FilterMine, k.FilterText, k.FilterClear, k.Preview},
 		{k.Sprint, k.Refresh, k.Help, k.Quit},
 	}
 }
