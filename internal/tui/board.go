@@ -728,7 +728,15 @@ func (m *boardModel) moveCol(d int) {
 	if m.colCursor >= len(m.grouped) {
 		m.colCursor = len(m.grouped) - 1
 	}
-	m.rowCursor = 0
+	// Preserve the row position across columns so h/l feels like a
+	// vim-style cursor rather than a "jump to top" reset. When the
+	// new column is shorter than the previous one, clamp to its
+	// last card; empty columns drop the cursor to 0.
+	if n := len(m.currentColIssues()); n == 0 {
+		m.rowCursor = 0
+	} else if m.rowCursor >= n {
+		m.rowCursor = n - 1
+	}
 	m.snapColOffset()
 }
 
