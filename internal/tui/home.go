@@ -134,6 +134,10 @@ type homeModel struct {
 	loading int
 	status  string
 	action  *HomeAction
+
+	// settings overlay (toggled with `,`).
+	settings     settingsModel
+	settingsOpen bool
 }
 
 func newHomeModel(svc api.Service, prev *HomeState) homeModel {
@@ -163,6 +167,7 @@ func newHomeModel(svc api.Service, prev *HomeState) homeModel {
 		spinner:      sp,
 		help:         help.New(),
 		keys:         defaultHomeKeys(),
+		settings:     newSettings(),
 		recent:       config.Get().Recent,
 		sections: []homeSection{
 			{title: "Assigned to me", jql: "assignee = currentUser() AND resolution = Unresolved ORDER BY updated DESC"},
@@ -262,6 +267,7 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
+		m.settings.SetSize(m.width, m.height-4)
 		m.vp.SetContent(m.renderBody())
 		m.snapViewportToCursor()
 		return m, nil
@@ -332,6 +338,22 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Settings overlay owns all keys while open: esc closes,
+		// q / ctrl+c still quit, everything else flows into the
+		// settings list (navigation + enter/space toggles).
+		if m.settingsOpen {
+			switch {
+			case key.Matches(msg, m.keys.Quit):
+				return m, tea.Quit
+			case key.Matches(msg, m.keys.Back):
+				m.settingsOpen = false
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.settings, cmd = m.settings.Update(msg)
+			return m, cmd
+		}
+
 		// Filter inputs grab the keystroke first so the user can
 		// type freely. Esc unfocuses; Enter runs the search /
 		// applies the filter.
@@ -346,6 +368,11 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch {
 		case key.Matches(msg, m.keys.Quit):
 			return m, tea.Quit
+		case key.Matches(msg, m.keys.Settings):
+			// Open the universal settings overlay (theme, …).
+			m.settingsOpen = true
+			m.settings.SetSize(m.width, m.height-4)
+			return m, nil
 		case key.Matches(msg, m.keys.Tab):
 			return m.switchTab(homeTab((int(m.tab) + 1) % len(allTabs)))
 		case key.Matches(msg, m.keys.ShiftTab):
@@ -354,10 +381,6 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.switchTab(tabDashboard)
 		case key.Matches(msg, m.keys.Boards):
 			return m.switchTab(tabBoards)
-		case key.Matches(msg, m.keys.Theme):
-			name := cycleTheme()
-			m.status = "theme: " + name
-			return m, nil
 		}
 
 		// Tab-specific keys.
@@ -712,6 +735,16 @@ func tabHotkey(t homeTab) string {
 }
 
 func (m homeModel) View() string {
+	// Settings overlay replaces the body so the user has the whole
+	// frame to navigate toggles. Header chrome stays so they
+	// remember where they came from. Esc returns to the dashboard.
+	if m.settingsOpen {
+		settingsHeader := titleBar("SETTINGS",
+			titleChipDim.Render("persisted to ~/.config/jr/config.yml"))
+		footer := m.help.View(m.keys)
+		return settingsHeader + "\n" + m.settings.View() + "\n" + footer
+	}
+
 	header := titleBar("JIRA · "+m.svc.Host(), titleChip.Render(m.svc.Me()))
 	tabs := m.renderTabStrip()
 	subBar := m.renderSubBar()
@@ -920,7 +953,7 @@ type homeKeys struct {
 	Tab, ShiftTab              key.Binding
 	Dashboard, Boards          key.Binding
 	Refresh, JQL               key.Binding
-	Theme                      key.Binding
+	Settings, Back             key.Binding
 	Help, Quit                 key.Binding
 }
 
@@ -942,7 +975,8 @@ func defaultHomeKeys() homeKeys {
 		Boards:    key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "Boards")),
 		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 		JQL:       key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
-		Theme:     key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "cycle theme")),
+		Settings:  key.NewBinding(key.WithKeys(","), key.WithHelp(",", "settings")),
+		Back:      key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
@@ -954,7 +988,7 @@ func (k homeKeys) ShortHelp() []key.Binding {
 func (k homeKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.HalfUp, k.HalfDown, k.Top, k.Bottom},
-		{k.Tab, k.ShiftTab, k.Dashboard, k.Boards, k.JQL, k.Refresh, k.Theme},
+		{k.Tab, k.ShiftTab, k.Dashboard, k.Boards, k.JQL, k.Refresh, k.Settings},
 		{k.Enter, k.Open, k.Help, k.Quit},
 	}
 }

@@ -103,6 +103,10 @@ type boardModel struct {
 	// the focused card's metadata without leaving the board. Uses
 	// only the data already on m.issues (no extra round-trip).
 	previewOpen bool
+
+	// settings overlay (toggled with `,`).
+	settings     settingsModel
+	settingsOpen bool
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
@@ -117,6 +121,7 @@ func newBoardModel(svc api.Service, boardID int) boardModel {
 		spinner:  sp,
 		help:     help.New(),
 		keys:     defaultBoardKeys(),
+		settings: newSettings(),
 		loading:  2, // config + sprints
 		vp:       viewport.New(0, 0),
 		selected: map[string]bool{},
@@ -457,6 +462,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		m.composeBody()
+		m.settings.SetSize(m.width, m.height-4)
 		if m.picker != nil {
 			m.picker.SetSize(m.width, m.height)
 		}
@@ -604,6 +610,21 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Settings overlay owns all keys while open: esc closes,
+		// q / ctrl+c still quit, everything else flows into the
+		// settings list (navigation + enter/space toggles).
+		if m.settingsOpen {
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.settingsOpen = false
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.settings, cmd = m.settings.Update(msg)
+			return m, cmd
+		}
 		// Picker eats all keys (including q/esc → cancel) while open.
 		if m.picker != nil {
 			cmd, _ := m.picker.Update(msg)
@@ -775,9 +796,10 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
 			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
-		case key.Matches(msg, m.keys.Theme):
-			name := cycleTheme()
-			m.status = "theme: " + name
+		case key.Matches(msg, m.keys.Settings):
+			// Open the universal settings overlay (theme, …).
+			m.settingsOpen = true
+			m.settings.SetSize(m.width, m.height-4)
 			return m, nil
 		case key.Matches(msg, m.keys.Sprint):
 			m.cycleSprint()
@@ -1075,6 +1097,16 @@ func (m boardModel) View() string {
 	}
 	if m.cfg == nil {
 		return paneMutedStyle.Render(m.spinner.View() + " loading board…")
+	}
+
+	// Settings overlay replaces the body so the user has the whole
+	// frame to navigate toggles. Header chrome stays so they
+	// remember where they came from. Esc returns to the board.
+	if m.settingsOpen {
+		settingsHeader := titleBar("SETTINGS",
+			titleChipDim.Render("persisted to ~/.config/jr/config.yml"))
+		footer := m.help.View(m.keys)
+		return settingsHeader + "\n" + m.settings.View() + "\n" + footer
 	}
 
 	// --- title bar ---
@@ -1549,7 +1581,7 @@ type boardKeys struct {
 	Preview                      key.Binding // i — toggle side preview
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
-	Theme                        key.Binding
+	Settings                     key.Binding
 	Help, Quit                   key.Binding
 }
 
@@ -1580,7 +1612,7 @@ func defaultBoardKeys() boardKeys {
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
 		Refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Theme:    key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "cycle theme")),
+		Settings: key.NewBinding(key.WithKeys(","), key.WithHelp(",", "settings")),
 		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "back")),
 	}
@@ -1595,6 +1627,6 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
 		{k.MoveLeft, k.MoveRight, k.Create, k.SelectToggle, k.SelectColumn},
 		{k.FilterMine, k.FilterText, k.FilterClear, k.Preview},
-		{k.Sprint, k.Refresh, k.Theme, k.Help, k.Quit},
+		{k.Sprint, k.Refresh, k.Settings, k.Help, k.Quit},
 	}
 }
