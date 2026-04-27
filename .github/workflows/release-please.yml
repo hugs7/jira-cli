@@ -1,0 +1,28 @@
+name: release-please
+
+# release-please watches commits to main, parses Conventional Commits
+# and maintains an open "Release PR" that bumps the version + updates
+# CHANGELOG.md. Merging that PR creates a git tag like v0.2.0, which
+# triggers .github/workflows/release.yml to build & publish the release.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # Use a PAT instead of GITHUB_TOKEN so the tag release-please
+          # creates triggers release.yml. GitHub deliberately suppresses
+          # workflow runs for events caused by the default GITHUB_TOKEN.
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}

@@ -1,4 +1,4 @@
-.PHONY: build test lint tidy run
+.PHONY: build test lint tidy run snapshot
 
 build:
 	go build -o jr ./cmd/jr
@@ -11,3 +11,6 @@ tidy:
 
 run: build
 	./jr --help
+
+snapshot:
+	goreleaser release --snapshot --clean
