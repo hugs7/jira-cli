@@ -106,6 +106,8 @@ type boardModel struct {
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
+	initTheme()
+
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
@@ -773,6 +775,10 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
 			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
+		case key.Matches(msg, m.keys.Theme):
+			name := cycleTheme()
+			m.status = "theme: " + name
+			return m, nil
 		case key.Matches(msg, m.keys.Sprint):
 			m.cycleSprint()
 			m.loading = 1
@@ -1543,6 +1549,7 @@ type boardKeys struct {
 	Preview                      key.Binding // i — toggle side preview
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
+	Theme                        key.Binding
 	Help, Quit                   key.Binding
 }
 
@@ -1573,6 +1580,7 @@ func defaultBoardKeys() boardKeys {
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
 		Refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Theme:    key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "cycle theme")),
 		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "back")),
 	}
@@ -1587,6 +1595,6 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
 		{k.MoveLeft, k.MoveRight, k.Create, k.SelectToggle, k.SelectColumn},
 		{k.FilterMine, k.FilterText, k.FilterClear, k.Preview},
-		{k.Sprint, k.Refresh, k.Help, k.Quit},
+		{k.Sprint, k.Refresh, k.Theme, k.Help, k.Quit},
 	}
 }

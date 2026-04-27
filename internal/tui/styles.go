@@ -10,6 +10,11 @@ import (
 
 // Shared title-bar / chip styling. Mirrors the look bb uses so a user
 // flipping between the two CLIs feels at home.
+//
+// These vars are reassigned by applyTheme() in theme.go on theme
+// changes; they MUST stay declared as plain `var` (not `const`) so
+// the cycler can rebind them at runtime without every call site
+// needing to know.
 var (
 	titleBarPad    = lipgloss.NewStyle().Padding(0, 1)
 	titleBadge     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("231")).Background(lipgloss.Color("57")).Padding(0, 1)

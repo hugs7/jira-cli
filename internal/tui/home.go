@@ -137,6 +137,10 @@ type homeModel struct {
 }
 
 func newHomeModel(svc api.Service, prev *HomeState) homeModel {
+	// Apply the user's persisted theme up-front so every style we
+	// initialise below already reflects the chosen palette.
+	initTheme()
+
 	ti := textinput.New()
 	ti.Prompt = "JQL › "
 	ti.Placeholder = "assignee = currentUser() AND resolution = Unresolved"
@@ -350,6 +354,10 @@ func (m homeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.switchTab(tabDashboard)
 		case key.Matches(msg, m.keys.Boards):
 			return m.switchTab(tabBoards)
+		case key.Matches(msg, m.keys.Theme):
+			name := cycleTheme()
+			m.status = "theme: " + name
+			return m, nil
 		}
 
 		// Tab-specific keys.
@@ -912,6 +920,7 @@ type homeKeys struct {
 	Tab, ShiftTab              key.Binding
 	Dashboard, Boards          key.Binding
 	Refresh, JQL               key.Binding
+	Theme                      key.Binding
 	Help, Quit                 key.Binding
 }
 
@@ -933,6 +942,7 @@ func defaultHomeKeys() homeKeys {
 		Boards:    key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "Boards")),
 		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
 		JQL:       key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
+		Theme:     key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "cycle theme")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 	}
@@ -944,7 +954,7 @@ func (k homeKeys) ShortHelp() []key.Binding {
 func (k homeKeys) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.PageUp, k.PageDown, k.HalfUp, k.HalfDown, k.Top, k.Bottom},
-		{k.Tab, k.ShiftTab, k.Dashboard, k.Boards, k.JQL, k.Refresh},
+		{k.Tab, k.ShiftTab, k.Dashboard, k.Boards, k.JQL, k.Refresh, k.Theme},
 		{k.Enter, k.Open, k.Help, k.Quit},
 	}
 }

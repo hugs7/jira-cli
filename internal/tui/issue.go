@@ -88,6 +88,8 @@ type issueModel struct {
 }
 
 func newIssueModel(svc api.Service, key string) issueModel {
+	initTheme()
+
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))

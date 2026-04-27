@@ -53,6 +53,11 @@ type Config struct {
 	Editor      string          `yaml:"editor,omitempty"` // command to launch text editor
 	Hosts       map[string]Host `yaml:"hosts"`
 
+	// Theme is the named TUI colour theme. See internal/tui/theme.go
+	// for the list of built-ins (default, dracula, solarized-dark,
+	// nord, 3270). Empty falls back to "default".
+	Theme string `yaml:"theme,omitempty"`
+
 	// Persisted dashboard state.
 	JQLPresets []JQLPreset   `yaml:"jql_presets,omitempty"`
 	Recent     []RecentIssue `yaml:"recent,omitempty"`
@@ -161,6 +166,12 @@ func AddRecent(host, key, summary string) error {
 
 func SetJQLPresets(p []JQLPreset) error {
 	loaded.JQLPresets = p
+	return save()
+}
+
+// SetTheme persists the chosen TUI theme name. Best-effort.
+func SetTheme(name string) error {
+	loaded.Theme = name
 	return save()
 }
 
