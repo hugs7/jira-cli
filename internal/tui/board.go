@@ -91,6 +91,13 @@ type boardModel struct {
 	// Bulk actions like H/L drag operate on this set when non-empty,
 	// otherwise on just the cursor card.
 	selected map[string]bool
+
+	// Quick filters applied client-side at regroup time. Filters
+	// don't reduce the underlying m.issues list — they only narrow
+	// what's bucketed into the visible columns, so toggling them
+	// off restores the full board without an API round-trip.
+	filterMine bool
+	filterText string
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
@@ -274,6 +281,49 @@ func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 	}
 }
 
+// passesFilters returns true when an issue matches every active
+// quick filter. Filters AND together: enabling both "mine" and a
+// text query keeps only issues that satisfy both.
+func (m *boardModel) passesFilters(iss api.Issue) bool {
+	if m.filterMine {
+		me := strings.ToLower(m.svc.Me())
+		// Match either the stable login (AssigneeKey) or the
+		// display name fallback so users whose configured `me`
+		// happens to be the display name still get sensible
+		// results.
+		if me == "" || (strings.ToLower(iss.AssigneeKey) != me &&
+			strings.ToLower(iss.Assignee) != me) {
+			return false
+		}
+	}
+	if m.filterText != "" {
+		q := strings.ToLower(m.filterText)
+		// Match against summary + key + assignee + labels — the
+		// fields the user is most likely typing about.
+		hay := strings.ToLower(iss.Summary + " " + iss.Key + " " + iss.Assignee + " " + strings.Join(iss.Labels, " "))
+		if !strings.Contains(hay, q) {
+			return false
+		}
+	}
+	return true
+}
+
+// filterChips renders a compact summary of the currently-active
+// filters for the title bar; "" when no filters are active.
+func (m *boardModel) filterChips() string {
+	parts := []string{}
+	if m.filterMine {
+		parts = append(parts, "mine")
+	}
+	if m.filterText != "" {
+		parts = append(parts, fmt.Sprintf("/%s/", m.filterText))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "filter: " + strings.Join(parts, " + ")
+}
+
 // maybeFireInitialIssues kicks off the first issue fetch once both
 // the board config and sprint list have arrived. Doing it any
 // earlier risks an extra round-trip (config-only → board scope, then
@@ -318,6 +368,27 @@ func (m *boardModel) bulkOrCursorKeys() []string {
 		return []string{iss.Key}
 	}
 	return nil
+}
+
+// openFilterPicker opens a free-text picker that sets the board's
+// substring filter against issue summaries / keys / labels. An
+// empty submission clears the filter; the picker pre-fills with
+// the current filter value so the user can edit rather than retype.
+func (m *boardModel) openFilterPicker() tea.Cmd {
+	loader := func(query string, token int) tea.Cmd {
+		return func() tea.Msg {
+			return pickerLoadedMsg{Token: token}
+		}
+	}
+	prompt := "summary / key / label…"
+	if m.filterText != "" {
+		prompt = "current: " + m.filterText + " — type new or empty to clear"
+	}
+	p := NewAsyncPicker("filter", "Filter cards by text", prompt, loader)
+	p.SetSize(m.width, m.height)
+	p.EnableFreeText()
+	m.picker = p
+	return p.Init()
 }
 
 // openCreatePicker opens a free-text picker for the user to type a
@@ -412,7 +483,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pickerDoneMsg:
 		m.picker = nil
 		if msg.Cancelled {
-			m.status = "create cancelled"
+			m.status = "cancelled"
 			m.layout()
 			return m, nil
 		}
@@ -430,6 +501,15 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, tea.Batch(m.spinner.Tick, cmd)
+		case "filter":
+			text, _ := msg.Value.(string)
+			m.filterText = strings.TrimSpace(text)
+			m.regroup()
+			m.clampCursor()
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
 		}
 		return m, nil
 
@@ -657,6 +737,25 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.layout()
 			m.composeBody()
 			return m, nil
+		case key.Matches(msg, m.keys.FilterMine):
+			m.filterMine = !m.filterMine
+			m.regroup()
+			m.clampCursor()
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
+		case key.Matches(msg, m.keys.FilterText):
+			return m, m.openFilterPicker()
+		case key.Matches(msg, m.keys.FilterClear):
+			m.filterMine = false
+			m.filterText = ""
+			m.regroup()
+			m.clampCursor()
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
 			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
@@ -692,6 +791,9 @@ func (m *boardModel) regroup() {
 	m.grouped = make([][]api.Issue, cols)
 	var other []api.Issue
 	for _, iss := range m.issues {
+		if !m.passesFilters(iss) {
+			continue
+		}
 		st := strings.ToLower(iss.Status)
 		placed := false
 		for i, c := range m.cfg.Columns {
@@ -1062,7 +1164,20 @@ func (m *boardModel) renderTitleBar() string {
 		chips = append(chips, titleChipDim.Render("all (no sprint filter)"))
 	}
 	if len(m.issues) > 0 {
-		chips = append(chips, titleChip.Render(fmt.Sprintf("%d issues", len(m.issues))))
+		// Show "visible / total" when filters are reducing the
+		// set so the user sees how aggressive the filter is.
+		visible := 0
+		for _, col := range m.grouped {
+			visible += len(col)
+		}
+		if (m.filterMine || m.filterText != "") && visible != len(m.issues) {
+			chips = append(chips, titleChip.Render(fmt.Sprintf("%d / %d issues", visible, len(m.issues))))
+		} else {
+			chips = append(chips, titleChip.Render(fmt.Sprintf("%d issues", len(m.issues))))
+		}
+	}
+	if chip := m.filterChips(); chip != "" {
+		chips = append(chips, titleChipWarn.Render(chip))
 	}
 	if m.loading > 0 {
 		chips = append(chips, paneMutedStyle.Render(m.spinner.View()+" loading"))
@@ -1319,6 +1434,7 @@ type boardKeys struct {
 	MoveLeft, MoveRight          key.Binding // H / L — drag card
 	Create                       key.Binding // c — inline new issue
 	SelectToggle, SelectColumn   key.Binding // v / V — bulk select
+	FilterMine, FilterText, FilterClear key.Binding // m / / / M — quick filters
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
 	Help, Quit                   key.Binding
@@ -1343,6 +1459,9 @@ func defaultBoardKeys() boardKeys {
 		Create:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "create issue…")),
 		SelectToggle: key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "select card")),
 		SelectColumn: key.NewBinding(key.WithKeys("V"), key.WithHelp("V", "select column")),
+		FilterMine:   key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "mine only")),
+		FilterText:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter…")),
+		FilterClear:  key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "clear filters")),
 		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
@@ -1360,6 +1479,7 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom, k.FirstCol, k.LastCol},
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
 		{k.MoveLeft, k.MoveRight, k.Create, k.SelectToggle, k.SelectColumn},
+		{k.FilterMine, k.FilterText, k.FilterClear},
 		{k.Sprint, k.Refresh, k.Help, k.Quit},
 	}
 }

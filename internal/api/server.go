@@ -207,6 +207,7 @@ func (s *serverService) toIssue(in srvIssue) Issue {
 	}
 	if in.Fields.Assignee != nil {
 		out.Assignee = in.Fields.Assignee.DisplayName
+		out.AssigneeKey = in.Fields.Assignee.Name
 	}
 	for _, c := range in.Fields.Components {
 		out.Components = append(out.Components, c.Name)
