@@ -65,6 +65,12 @@ type boardModel struct {
 	loading int // count of in-flight loads
 	err     error
 	status  string // transient one-line feedback for the help row
+
+	// Initial-load gates: the first issues fetch waits for *both*
+	// the board config (we need column→status mappings to render)
+	// and the sprint list (so the fetch is sprint-scoped from the
+	// start instead of pulling the whole board, then refetching).
+	gotConfig, gotSprints, initialIssuesFired bool
 	spinner spinner.Model
 	help    help.Model
 	keys    boardKeys
@@ -235,6 +241,21 @@ func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 	}
 }
 
+// maybeFireInitialIssues kicks off the first issue fetch once both
+// the board config and sprint list have arrived. Doing it any
+// earlier risks an extra round-trip (config-only → board scope, then
+// sprint scope after sprints arrive); doing it any later means the
+// user stares at an empty board for an extra HTTP round-trip's
+// worth of latency.
+func (m *boardModel) maybeFireInitialIssues() tea.Cmd {
+	if m.initialIssuesFired || !m.gotConfig || !m.gotSprints {
+		return nil
+	}
+	m.initialIssuesFired = true
+	m.loading++
+	return tea.Batch(m.spinner.Tick, m.fetchIssues())
+}
+
 // selectionLabel renders the selection-count chip used in the
 // status footer; "" when nothing is selected so the footer hides.
 func (m *boardModel) selectionLabel() string {
@@ -400,6 +421,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cfg = msg.cfg
+		m.gotConfig = true
 		if m.loading > 0 {
 			m.loading--
 		}
@@ -407,12 +429,11 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// re-measured before the next render.
 		m.layout()
 		m.composeBody()
-		// Now that we know the columns, kick off issues load too.
-		m.loading++
-		return m, m.fetchIssues()
+		return m, m.maybeFireInitialIssues()
 
 	case boardSprintsMsg:
 		m.sprints = msg.sprints
+		m.gotSprints = true
 		// Auto-pick the active sprint if exactly one is open.
 		for _, s := range msg.sprints {
 			if strings.EqualFold(s.State, "active") {
@@ -424,7 +445,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading--
 		}
 		m.layout()
-		return m, nil
+		return m, m.maybeFireInitialIssues()
 
 	case cardMovedMsg:
 		if m.loading > 0 {
