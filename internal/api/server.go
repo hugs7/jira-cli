@@ -23,6 +23,11 @@ type serverService struct {
 	// strings mean "not yet discovered or absent on this instance".
 	cfStoryPoints string
 	cfDiscovered  bool
+
+	// Per-instance status id→name map, populated lazily by
+	// statusIDLookup. The list rarely changes; caching avoids a
+	// /status round-trip on every GetBoardConfig.
+	statusNames map[string]string
 }
 
 func (s *serverService) Host() string    { return s.host }
@@ -202,6 +207,7 @@ func (s *serverService) toIssue(in srvIssue) Issue {
 	}
 	if in.Fields.Assignee != nil {
 		out.Assignee = in.Fields.Assignee.DisplayName
+		out.AssigneeKey = in.Fields.Assignee.Name
 	}
 	for _, c := range in.Fields.Components {
 		out.Components = append(out.Components, c.Name)
@@ -1112,9 +1118,14 @@ func (s *serverService) GetBoardConfig(boardID int) (*BoardConfig, error) {
 }
 
 // statusIDLookup fetches every status definition on the instance and
-// returns an id→name map. Cached implicitly per call (cheap, the
-// payload is a few KB).
+// returns an id→name map. Cached on the service after the first hit
+// because workflow status definitions are effectively static across
+// a session — re-fetching once per GetBoardConfig was the single
+// most expensive part of opening a board.
 func (s *serverService) statusIDLookup() (map[string]string, error) {
+	if s.statusNames != nil {
+		return s.statusNames, nil
+	}
 	var raw []struct {
 		ID   string `json:"id"`
 		Name string `json:"name"`
@@ -1126,6 +1137,7 @@ func (s *serverService) statusIDLookup() (map[string]string, error) {
 	for _, r := range raw {
 		out[r.ID] = r.Name
 	}
+	s.statusNames = out
 	return out, nil
 }
 
@@ -1174,19 +1186,59 @@ func (s *serverService) ListBoardIssues(boardID, sprintID int, jqlFilter string,
 	} else {
 		endpoint = s.agileURL(fmt.Sprintf("board/%d/issue", boardID))
 	}
-	params := map[string]string{"maxResults": itoa(max)}
+	// Discover custom-field IDs up-front so the first board fetch
+	// can request the story-points field by id (without it the cards
+	// show no point estimates until the user opens an individual
+	// issue, which is what triggers discovery via GetIssue).
+	if !s.cfDiscovered {
+		s.discoverCustomFields()
+	}
+	// Field projection: ask Jira only for what the card renderer
+	// actually uses. The default response includes ~30 fields per
+	// issue (worklog, votes, attachment, description, …) which on a
+	// board of 200 issues becomes the dominant cost of the call.
+	cardFields := []string{"summary", "issuetype", "status", "assignee", "priority", "labels", "parent"}
+	if s.cfStoryPoints != "" {
+		cardFields = append(cardFields, s.cfStoryPoints)
+	}
+	params := map[string]string{
+		"maxResults": itoa(max),
+		"fields":     strings.Join(cardFields, ","),
+	}
 	if jqlFilter != "" {
 		params["jql"] = jqlFilter
 	}
 	endpoint += queryString(params)
 
-	var resp srvSearchResp
-	if err := s.client.getJSON(endpoint, &resp); err != nil {
+	body, err := s.client.getRaw(endpoint)
+	if err != nil {
 		return nil, err
+	}
+	// Decode twice: once for the typed shape used by toIssue, once
+	// generically so applyCustomFields can fish out story-points
+	// from each issue's customfield_xxxxx.
+	var resp srvSearchResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, err
+	}
+	var generic struct {
+		Issues []struct {
+			Key    string                     `json:"key"`
+			Fields map[string]json.RawMessage `json:"fields"`
+		} `json:"issues"`
+	}
+	_ = json.Unmarshal(body, &generic)
+	cfByKey := map[string]map[string]json.RawMessage{}
+	for _, g := range generic.Issues {
+		cfByKey[g.Key] = g.Fields
 	}
 	out := make([]Issue, 0, len(resp.Issues))
 	for _, i := range resp.Issues {
-		out = append(out, s.toIssue(i))
+		iss := s.toIssue(i)
+		if cf, ok := cfByKey[i.Key]; ok {
+			s.applyCustomFields(&iss, cf)
+		}
+		out = append(out, iss)
 	}
 	return out, nil
 }

@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
@@ -11,6 +12,29 @@ import (
 	"github.com/hugs7/jira-cli/internal/api"
 	"github.com/hugs7/jira-cli/internal/config"
 )
+
+// validateHostname rejects URLs / paths that look like a copy-pasted
+// browser address. We want a bare hostname (or host:port) so the
+// API base templates ("https://%s/rest/api/3") don't end up with
+// "https://https://acme.atlassian.net" or similar nonsense.
+func validateHostname(s string) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return fmt.Errorf("hostname is required")
+	}
+	low := strings.ToLower(s)
+	if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") {
+		return fmt.Errorf("enter the hostname only — drop the http(s):// scheme (e.g. %q not %q)",
+			strings.TrimPrefix(strings.TrimPrefix(low, "https://"), "http://"), s)
+	}
+	if strings.ContainsAny(s, "/?#") {
+		return fmt.Errorf("enter the hostname only — drop the path / query (got %q)", s)
+	}
+	if strings.ContainsAny(s, " \t") {
+		return fmt.Errorf("hostname must not contain whitespace")
+	}
+	return nil
+}
 
 func newAuthCmd() *cobra.Command {
 	c := &cobra.Command{
@@ -31,6 +55,13 @@ func newAuthLoginCmd() *cobra.Command {
 		Use:   "login",
 		Short: "Log in to a Jira host",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Guard the --host flag too so flag-driven invocations can't
+			// sneak a scheme/path past the prompt validator.
+			if host != "" {
+				if err := validateHostname(host); err != nil {
+					return err
+				}
+			}
 			// Step 1: ask for the host so we can pick a smart default
 			// for the host type ("cloud" for *.atlassian.net,
 			// otherwise "server").
@@ -39,7 +70,8 @@ func newAuthLoginCmd() *cobra.Command {
 					huh.NewInput().
 						Title("Jira host").
 						Description("Hostname only, e.g. acme.atlassian.net or jira.mycorp.example").
-						Value(&host),
+						Value(&host).
+						Validate(validateHostname),
 				),
 			).Run(); err != nil {
 				return err
