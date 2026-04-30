@@ -46,6 +46,18 @@ curl -fsSL https://raw.githubusercontent.com/hugs7/jira-cli/main/scripts/install
 irm https://raw.githubusercontent.com/hugs7/jira-cli/main/scripts/install.ps1 | iex
 ```
 
+### Manual install (macOS + zsh, no sudo, no Homebrew)
+
+Drops the binary into `~/.local/bin/jr` and the zsh completion into
+`~/.zsh/completions/_jr`, and adds the necessary `fpath` snippet to
+`~/.zshrc` (idempotent — re-run any time to upgrade in place):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hugs7/jira-cli/main/scripts/install-mac-zsh.sh | sh
+```
+
+Make sure `~/.local/bin` is on your `$PATH`.
+
 ### From source
 
 ```sh
