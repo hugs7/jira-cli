@@ -65,6 +65,12 @@ type boardModel struct {
 	loading int // count of in-flight loads
 	err     error
 	status  string // transient one-line feedback for the help row
+
+	// Initial-load gates: the first issues fetch waits for *both*
+	// the board config (we need column→status mappings to render)
+	// and the sprint list (so the fetch is sprint-scoped from the
+	// start instead of pulling the whole board, then refetching).
+	gotConfig, gotSprints, initialIssuesFired bool
 	spinner spinner.Model
 	help    help.Model
 	keys    boardKeys
@@ -85,9 +91,27 @@ type boardModel struct {
 	// Bulk actions like H/L drag operate on this set when non-empty,
 	// otherwise on just the cursor card.
 	selected map[string]bool
+
+	// Quick filters applied client-side at regroup time. Filters
+	// don't reduce the underlying m.issues list — they only narrow
+	// what's bucketed into the visible columns, so toggling them
+	// off restores the full board without an API round-trip.
+	filterMine bool
+	filterText string
+
+	// previewOpen toggles the right-hand preview pane that shows
+	// the focused card's metadata without leaving the board. Uses
+	// only the data already on m.issues (no extra round-trip).
+	previewOpen bool
+
+	// settings overlay (toggled with `,`).
+	settings     settingsModel
+	settingsOpen bool
 }
 
 func newBoardModel(svc api.Service, boardID int) boardModel {
+	initTheme()
+
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
@@ -97,6 +121,7 @@ func newBoardModel(svc api.Service, boardID int) boardModel {
 		spinner:  sp,
 		help:     help.New(),
 		keys:     defaultBoardKeys(),
+		settings: newSettings(),
 		loading:  2, // config + sprints
 		vp:       viewport.New(0, 0),
 		selected: map[string]bool{},
@@ -201,6 +226,39 @@ func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 	} else {
 		label = fmt.Sprintf("%d cards → %s", len(keys), colName)
 	}
+
+	// Optimistic local update: rewrite each moved issue's status
+	// to the target column's first status key, regroup, and follow
+	// the focused card to its new column position. This makes H/L
+	// feel instant — the API round-trip happens in the background
+	// and only refetches if it fails.
+	targetStatus := col.StatusKeys[0]
+	keySet := map[string]bool{}
+	for _, k := range keys {
+		keySet[k] = true
+	}
+	focusedKey := ""
+	if iss, ok := m.cardAtCursor(); ok {
+		focusedKey = iss.Key
+	}
+	for i := range m.issues {
+		if keySet[m.issues[i].Key] {
+			m.issues[i].Status = targetStatus
+		}
+	}
+	m.regroup()
+	if focusedKey != "" && keySet[focusedKey] {
+		for ri, iss := range m.grouped[target] {
+			if iss.Key == focusedKey {
+				m.colCursor = target
+				m.rowCursor = ri
+				break
+			}
+		}
+	}
+	m.snapColOffset()
+	m.composeBody()
+	m.snapVP()
 	m.loading++
 	return func() tea.Msg {
 		var firstErr error
@@ -235,6 +293,64 @@ func (m *boardModel) moveCardCmd(dir int) tea.Cmd {
 	}
 }
 
+// passesFilters returns true when an issue matches every active
+// quick filter. Filters AND together: enabling both "mine" and a
+// text query keeps only issues that satisfy both.
+func (m *boardModel) passesFilters(iss api.Issue) bool {
+	if m.filterMine {
+		me := strings.ToLower(m.svc.Me())
+		// Match either the stable login (AssigneeKey) or the
+		// display name fallback so users whose configured `me`
+		// happens to be the display name still get sensible
+		// results.
+		if me == "" || (strings.ToLower(iss.AssigneeKey) != me &&
+			strings.ToLower(iss.Assignee) != me) {
+			return false
+		}
+	}
+	if m.filterText != "" {
+		q := strings.ToLower(m.filterText)
+		// Match against summary + key + assignee + labels — the
+		// fields the user is most likely typing about.
+		hay := strings.ToLower(iss.Summary + " " + iss.Key + " " + iss.Assignee + " " + strings.Join(iss.Labels, " "))
+		if !strings.Contains(hay, q) {
+			return false
+		}
+	}
+	return true
+}
+
+// filterChips renders a compact summary of the currently-active
+// filters for the title bar; "" when no filters are active.
+func (m *boardModel) filterChips() string {
+	parts := []string{}
+	if m.filterMine {
+		parts = append(parts, "mine")
+	}
+	if m.filterText != "" {
+		parts = append(parts, fmt.Sprintf("/%s/", m.filterText))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "filter: " + strings.Join(parts, " + ")
+}
+
+// maybeFireInitialIssues kicks off the first issue fetch once both
+// the board config and sprint list have arrived. Doing it any
+// earlier risks an extra round-trip (config-only → board scope, then
+// sprint scope after sprints arrive); doing it any later means the
+// user stares at an empty board for an extra HTTP round-trip's
+// worth of latency.
+func (m *boardModel) maybeFireInitialIssues() tea.Cmd {
+	if m.initialIssuesFired || !m.gotConfig || !m.gotSprints {
+		return nil
+	}
+	m.initialIssuesFired = true
+	m.loading++
+	return tea.Batch(m.spinner.Tick, m.fetchIssues())
+}
+
 // selectionLabel renders the selection-count chip used in the
 // status footer; "" when nothing is selected so the footer hides.
 func (m *boardModel) selectionLabel() string {
@@ -264,6 +380,27 @@ func (m *boardModel) bulkOrCursorKeys() []string {
 		return []string{iss.Key}
 	}
 	return nil
+}
+
+// openFilterPicker opens a free-text picker that sets the board's
+// substring filter against issue summaries / keys / labels. An
+// empty submission clears the filter; the picker pre-fills with
+// the current filter value so the user can edit rather than retype.
+func (m *boardModel) openFilterPicker() tea.Cmd {
+	loader := func(query string, token int) tea.Cmd {
+		return func() tea.Msg {
+			return pickerLoadedMsg{Token: token}
+		}
+	}
+	prompt := "summary / key / label…"
+	if m.filterText != "" {
+		prompt = "current: " + m.filterText + " — type new or empty to clear"
+	}
+	p := NewAsyncPicker("filter", "Filter cards by text", prompt, loader)
+	p.SetSize(m.width, m.height)
+	p.EnableFreeText()
+	m.picker = p
+	return p.Init()
 }
 
 // openCreatePicker opens a free-text picker for the user to type a
@@ -325,6 +462,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		m.composeBody()
+		m.settings.SetSize(m.width, m.height-4)
 		if m.picker != nil {
 			m.picker.SetSize(m.width, m.height)
 		}
@@ -358,7 +496,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pickerDoneMsg:
 		m.picker = nil
 		if msg.Cancelled {
-			m.status = "create cancelled"
+			m.status = "cancelled"
 			m.layout()
 			return m, nil
 		}
@@ -376,6 +514,15 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, tea.Batch(m.spinner.Tick, cmd)
+		case "filter":
+			text, _ := msg.Value.(string)
+			m.filterText = strings.TrimSpace(text)
+			m.regroup()
+			m.clampCursor()
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
 		}
 		return m, nil
 
@@ -400,6 +547,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cfg = msg.cfg
+		m.gotConfig = true
 		if m.loading > 0 {
 			m.loading--
 		}
@@ -407,12 +555,11 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// re-measured before the next render.
 		m.layout()
 		m.composeBody()
-		// Now that we know the columns, kick off issues load too.
-		m.loading++
-		return m, m.fetchIssues()
+		return m, m.maybeFireInitialIssues()
 
 	case boardSprintsMsg:
 		m.sprints = msg.sprints
+		m.gotSprints = true
 		// Auto-pick the active sprint if exactly one is open.
 		for _, s := range msg.sprints {
 			if strings.EqualFold(s.State, "active") {
@@ -424,7 +571,7 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading--
 		}
 		m.layout()
-		return m, nil
+		return m, m.maybeFireInitialIssues()
 
 	case cardMovedMsg:
 		if m.loading > 0 {
@@ -433,18 +580,22 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status = "✗ " + msg.label + ": " + msg.err.Error()
 			m.layout()
-			m.composeBody()
-			return m, nil
+			// Refetch to roll back the optimistic local update —
+			// without this, the card would stay in its target
+			// column visually even though Jira rejected the move.
+			m.loading++
+			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
 		}
 		m.status = "✓ " + msg.label
 		// Clear the multi-select set: those cards have moved and
 		// keeping them selected on the next view is rarely useful.
 		m.selected = map[string]bool{}
 		m.layout()
-		// The card has changed status; refetch the board so the
-		// regroup picks up the new column placement.
-		m.loading++
-		return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
+		m.composeBody()
+		// No refetch on success — the optimistic update already
+		// matches what Jira now has, and skipping the round-trip
+		// is what makes successive H/L presses feel snappy.
+		return m, nil
 
 	case boardIssuesMsg:
 		m.issues = msg.issues
@@ -459,6 +610,21 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Settings overlay owns all keys while open: esc closes,
+		// q / ctrl+c still quit, everything else flows into the
+		// settings list (navigation + enter/space toggles).
+		if m.settingsOpen {
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.settingsOpen = false
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.settings, cmd = m.settings.Update(msg)
+			return m, cmd
+		}
 		// Picker eats all keys (including q/esc → cancel) while open.
 		if m.picker != nil {
 			cmd, _ := m.picker.Update(msg)
@@ -599,9 +765,42 @@ func (m boardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.layout()
 			m.composeBody()
 			return m, nil
+		case key.Matches(msg, m.keys.FilterMine):
+			m.filterMine = !m.filterMine
+			m.regroup()
+			m.clampCursor()
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
+		case key.Matches(msg, m.keys.FilterText):
+			return m, m.openFilterPicker()
+		case key.Matches(msg, m.keys.FilterClear):
+			m.filterMine = false
+			m.filterText = ""
+			m.regroup()
+			m.clampCursor()
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
+		case key.Matches(msg, m.keys.Preview):
+			m.previewOpen = !m.previewOpen
+			// Layout depends on previewWidth(); recompute the
+			// viewport size and re-render cards into the new
+			// boardWidth before painting.
+			m.layout()
+			m.composeBody()
+			m.snapVP()
+			return m, nil
 		case key.Matches(msg, m.keys.Refresh):
 			m.loading = 1
 			return m, tea.Batch(m.spinner.Tick, m.fetchIssues())
+		case key.Matches(msg, m.keys.Settings):
+			// Open the universal settings overlay (theme, …).
+			m.settingsOpen = true
+			m.settings.SetSize(m.width, m.height-4)
+			return m, nil
 		case key.Matches(msg, m.keys.Sprint):
 			m.cycleSprint()
 			m.loading = 1
@@ -634,6 +833,9 @@ func (m *boardModel) regroup() {
 	m.grouped = make([][]api.Issue, cols)
 	var other []api.Issue
 	for _, iss := range m.issues {
+		if !m.passesFilters(iss) {
+			continue
+		}
 		st := strings.ToLower(iss.Status)
 		placed := false
 		for i, c := range m.cfg.Columns {
@@ -707,7 +909,15 @@ func (m *boardModel) moveCol(d int) {
 	if m.colCursor >= len(m.grouped) {
 		m.colCursor = len(m.grouped) - 1
 	}
-	m.rowCursor = 0
+	// Preserve the row position across columns so h/l feels like a
+	// vim-style cursor rather than a "jump to top" reset. When the
+	// new column is shorter than the previous one, clamp to its
+	// last card; empty columns drop the cursor to 0.
+	if n := len(m.currentColIssues()); n == 0 {
+		m.rowCursor = 0
+	} else if m.rowCursor >= n {
+		m.rowCursor = n - 1
+	}
 	m.snapColOffset()
 }
 
@@ -781,12 +991,42 @@ const (
 	cardMaxWidth = 36
 )
 
+// previewWidth returns the right-pane width when the preview is
+// open, 0 otherwise. The pane is suppressed on terminals too narrow
+// to fit a single card next to it (under ~80 cols total) — without
+// this guard the board collapses to a useless one-column strip.
+func (m *boardModel) previewWidth() int {
+	if !m.previewOpen || m.width < 80 {
+		return 0
+	}
+	w := m.width / 3
+	if w < 32 {
+		w = 32
+	}
+	if w > 60 {
+		w = 60
+	}
+	return w
+}
+
+// boardWidth returns the columns of horizontal space the board itself
+// gets to render in (total width minus any preview pane). Used by
+// every geometry function that previously read m.width directly.
+func (m *boardModel) boardWidth() int {
+	w := m.width - m.previewWidth()
+	if w < 30 {
+		w = 30
+	}
+	return w
+}
+
 func (m *boardModel) visibleColumns() int {
-	if m.width <= 0 {
+	bw := m.boardWidth()
+	if bw <= 0 {
 		return 1
 	}
 	w := cardMinWidth + 2 // border
-	v := m.width / w
+	v := bw / w
 	if v < 1 {
 		v = 1
 	}
@@ -801,7 +1041,7 @@ func (m *boardModel) cardWidth() int {
 	if visible <= 0 {
 		return cardMinWidth
 	}
-	w := (m.width - 2*visible) / visible
+	w := (m.boardWidth() - 2*visible) / visible
 	if w < cardMinWidth {
 		w = cardMinWidth
 	}
@@ -859,6 +1099,16 @@ func (m boardModel) View() string {
 		return paneMutedStyle.Render(m.spinner.View() + " loading board…")
 	}
 
+	// Settings overlay replaces the body so the user has the whole
+	// frame to navigate toggles. Header chrome stays so they
+	// remember where they came from. Esc returns to the board.
+	if m.settingsOpen {
+		settingsHeader := titleBar("SETTINGS",
+			titleChipDim.Render("persisted to ~/.config/jr/config.yml"))
+		footer := m.help.View(m.keys)
+		return settingsHeader + "\n" + m.settings.View() + "\n" + footer
+	}
+
 	// --- title bar ---
 	header := m.renderTitleBar()
 
@@ -875,8 +1125,69 @@ func (m boardModel) View() string {
 			lipgloss.WithWhitespaceChars(" "))
 		headerRow = strings.Repeat(" ", m.width)
 	}
+
+	// --- side-by-side board + preview ---
+	if pw := m.previewWidth(); pw > 0 && m.picker == nil {
+		bw := m.boardWidth()
+		boardCol := lipgloss.JoinVertical(lipgloss.Left, headerRow, body)
+		boardCol = lipgloss.NewStyle().Width(bw).Render(boardCol)
+		preview := lipgloss.NewStyle().Width(pw).
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(lipgloss.Color("8")).
+			PaddingLeft(1).
+			Render(m.renderPreview(pw - 3))
+		split := lipgloss.JoinHorizontal(lipgloss.Top, boardCol, preview)
+		return strings.Join([]string{header, "", split, m.renderFooter()}, "\n")
+	}
+
 	// --- footer ---
 	return strings.Join([]string{header, "", headerRow, body, m.renderFooter()}, "\n")
+}
+
+// renderPreview builds the right-pane content for the focused card.
+// Uses only fields already on m.issues so it's instant on cursor
+// move (no extra round-trip); summary is wrapped to the available
+// width and the bottom suggests Enter for the full viewer.
+func (m *boardModel) renderPreview(w int) string {
+	iss, ok := m.cardAtCursor()
+	if !ok {
+		return paneMutedStyle.Render("(no card focused)")
+	}
+	if w < 16 {
+		w = 16
+	}
+	typeCol := issueTypeColor(iss.IssueType)
+	keyLine := lipgloss.NewStyle().Bold(true).Foreground(typeCol).Render(iss.Key)
+	if iss.IssueType != "" {
+		keyLine += "  " + lipgloss.NewStyle().Foreground(typeCol).Render("· "+iss.IssueType)
+	}
+	summary := wrap(iss.Summary, w, 8)
+	if summary == "" {
+		summary = paneMutedStyle.Render("(no summary)")
+	}
+	chips := []string{styleStatus(iss.StatusCat).Render(iss.Status)}
+	if iss.Priority != "" {
+		chips = append(chips, titleChipWarn.Render(iss.Priority))
+	}
+	if iss.StoryPoints > 0 {
+		chips = append(chips, titleChip.Render(fmt.Sprintf("⛶ %g", iss.StoryPoints)))
+	}
+	chipLine := strings.Join(chips, " ")
+
+	rows := []string{keyLine, "", summary, "", chipLine}
+	if iss.Assignee != "" {
+		rows = append(rows, paneMutedStyle.Render("Assignee:"), "  "+iss.Assignee)
+	} else {
+		rows = append(rows, paneMutedStyle.Render("Assignee:"), "  "+paneMutedStyle.Render("unassigned"))
+	}
+	if len(iss.Labels) > 0 {
+		rows = append(rows, "", paneMutedStyle.Render("Labels:"), "  "+strings.Join(iss.Labels, ", "))
+	}
+	if iss.ParentKey != "" {
+		rows = append(rows, "", paneMutedStyle.Render("Parent:"), "  "+iss.ParentKey)
+	}
+	rows = append(rows, "", paneMutedStyle.Render("enter → full view"))
+	return strings.Join(rows, "\n")
 }
 
 // renderFooter composes the status + help row. Used both by View
@@ -909,7 +1220,7 @@ func (m *boardModel) renderFooter() string {
 // clipped by however many lines the chrome had grown by — pressing G
 // looked like it didn't scroll quite far enough.
 func (m *boardModel) layout() {
-	w := m.width
+	w := m.boardWidth()
 	if w < 30 {
 		w = 30
 	}
@@ -996,7 +1307,20 @@ func (m *boardModel) renderTitleBar() string {
 		chips = append(chips, titleChipDim.Render("all (no sprint filter)"))
 	}
 	if len(m.issues) > 0 {
-		chips = append(chips, titleChip.Render(fmt.Sprintf("%d issues", len(m.issues))))
+		// Show "visible / total" when filters are reducing the
+		// set so the user sees how aggressive the filter is.
+		visible := 0
+		for _, col := range m.grouped {
+			visible += len(col)
+		}
+		if (m.filterMine || m.filterText != "") && visible != len(m.issues) {
+			chips = append(chips, titleChip.Render(fmt.Sprintf("%d / %d issues", visible, len(m.issues))))
+		} else {
+			chips = append(chips, titleChip.Render(fmt.Sprintf("%d issues", len(m.issues))))
+		}
+	}
+	if chip := m.filterChips(); chip != "" {
+		chips = append(chips, titleChipWarn.Render(chip))
 	}
 	if m.loading > 0 {
 		chips = append(chips, paneMutedStyle.Render(m.spinner.View()+" loading"))
@@ -1253,8 +1577,11 @@ type boardKeys struct {
 	MoveLeft, MoveRight          key.Binding // H / L — drag card
 	Create                       key.Binding // c — inline new issue
 	SelectToggle, SelectColumn   key.Binding // v / V — bulk select
+	FilterMine, FilterText, FilterClear key.Binding // m / / / M — quick filters
+	Preview                      key.Binding // i — toggle side preview
 	Enter, Open                  key.Binding
 	Sprint, Refresh              key.Binding
+	Settings                     key.Binding
 	Help, Quit                   key.Binding
 }
 
@@ -1277,10 +1604,15 @@ func defaultBoardKeys() boardKeys {
 		Create:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "create issue…")),
 		SelectToggle: key.NewBinding(key.WithKeys("v"), key.WithHelp("v", "select card")),
 		SelectColumn: key.NewBinding(key.WithKeys("V"), key.WithHelp("V", "select column")),
+		FilterMine:   key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "mine only")),
+		FilterText:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter…")),
+		FilterClear:  key.NewBinding(key.WithKeys("M"), key.WithHelp("M", "clear filters")),
+		Preview:      key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "preview pane")),
 		Enter:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "open issue")),
 		Open:     key.NewBinding(key.WithKeys("o"), key.WithHelp("o", "browser")),
 		Sprint:   key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "cycle sprint")),
 		Refresh:  key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+		Settings: key.NewBinding(key.WithKeys(","), key.WithHelp(",", "settings")),
 		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c", "esc"), key.WithHelp("q", "back")),
 	}
@@ -1294,6 +1626,7 @@ func (k boardKeys) FullHelp() [][]key.Binding {
 		{k.Left, k.Right, k.Up, k.Down, k.Top, k.Bottom, k.FirstCol, k.LastCol},
 		{k.HalfDown, k.HalfUp, k.PageDown, k.PageUp, k.Enter, k.Open},
 		{k.MoveLeft, k.MoveRight, k.Create, k.SelectToggle, k.SelectColumn},
-		{k.Sprint, k.Refresh, k.Help, k.Quit},
+		{k.FilterMine, k.FilterText, k.FilterClear, k.Preview},
+		{k.Sprint, k.Refresh, k.Settings, k.Help, k.Quit},
 	}
 }

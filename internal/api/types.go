@@ -17,7 +17,8 @@ type Issue struct {
 	Resolution  string
 	Project     string // project key (e.g. "FOO")
 	Reporter    string
-	Assignee    string
+	Assignee    string // display name (e.g. "Hugo Burton")
+	AssigneeKey string // login name / accountId — stable identifier for filtering
 	Labels      []string
 	Components  []string
 	FixVersions []string

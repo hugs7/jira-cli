@@ -18,6 +18,7 @@ import (
 
 	"github.com/hugs7/jira-cli/internal/api"
 	"github.com/hugs7/jira-cli/internal/config"
+	"github.com/hugs7/jira-cli/internal/tui/mdrender"
 )
 
 // Issue runs the interactive issue viewer for the given key. Loops
@@ -85,9 +86,15 @@ type issueModel struct {
 	spinner spinner.Model
 	help    help.Model
 	keys    issueKeys
+
+	// settings overlay (toggled with `,`).
+	settings     settingsModel
+	settingsOpen bool
 }
 
 func newIssueModel(svc api.Service, key string) issueModel {
+	initTheme()
+
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("13"))
@@ -103,6 +110,7 @@ func newIssueModel(svc api.Service, key string) issueModel {
 		spinner:    sp,
 		help:       help.New(),
 		keys:       defaultIssueKeys(),
+		settings:   newSettings(),
 		loading:    3,
 	}
 }
@@ -161,6 +169,7 @@ func (m issueModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.layout()
 		m.refreshContent()
+		m.settings.SetSize(m.width, m.height-4)
 		if m.picker != nil {
 			m.picker.SetSize(m.width, m.height)
 		}
@@ -311,6 +320,21 @@ func (m issueModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.applyPicker(msg)
 
 	case tea.KeyMsg:
+		// Settings overlay owns all keys while open: esc closes,
+		// q / ctrl+c still quit, everything else flows into the
+		// settings list (navigation + enter/space toggles).
+		if m.settingsOpen {
+			switch msg.String() {
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			case "esc":
+				m.settingsOpen = false
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.settings, cmd = m.settings.Update(msg)
+			return m, cmd
+		}
 		// Picker eats all keys while open.
 		if m.picker != nil && m.mode == modePicker {
 			cmd, _ := m.picker.Update(msg)
@@ -341,6 +365,11 @@ func (m issueModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, m.keys.Quit):
 		return m, tea.Quit
+	case key.Matches(msg, m.keys.Settings):
+		// Open the universal settings overlay (theme, …).
+		m.settingsOpen = true
+		m.settings.SetSize(m.width, m.height-4)
+		return m, nil
 	case key.Matches(msg, m.keys.Back):
 		switch m.mode {
 		case modeDescription:
@@ -695,6 +724,12 @@ func (m *issueModel) refreshContent() {
 		desc := m.issue.Description
 		if strings.TrimSpace(desc) == "" {
 			desc = paneMutedStyle.Render("(no description)")
+		} else {
+			// Render markdown so headings, bold, lists, code blocks,
+			// and inline code show up as styled output instead of raw
+			// `*foo*` / `` `bar` `` — same treatment bb-cli uses for
+			// PR descriptions and READMEs.
+			desc = mdrender.Render(desc, m.desc.Width)
 		}
 		m.desc.SetContent(desc)
 	}
@@ -707,6 +742,15 @@ func (m *issueModel) refreshContent() {
 func (m issueModel) View() string {
 	if m.err != nil {
 		return statusErr.Render("error: "+m.err.Error()) + "\n\npress q to quit"
+	}
+
+	// Settings overlay replaces the body so the user has the whole
+	// frame to navigate toggles. Esc returns to the issue.
+	if m.settingsOpen {
+		settingsHeader := titleBar("SETTINGS",
+			titleChipDim.Render("persisted to ~/.config/jr/config.yml"))
+		footer := m.help.View(m.keys)
+		return settingsHeader + "\n" + m.settings.View() + "\n" + footer
 	}
 
 	header := m.renderHeader()
@@ -836,6 +880,15 @@ func (m issueModel) renderComments() string {
 		body := strings.TrimSpace(c.Body)
 		if body == "" {
 			body = paneMutedStyle.Render("(empty)")
+		} else {
+			// Render comment markdown (headings, bold, lists, code
+			// blocks, …). Indent width = pane width minus the 4-cell
+			// indent so wrapped lines stay inside the comment column.
+			w := m.commentsVP.Width - 4
+			if w < 20 {
+				w = 20
+			}
+			body = mdrender.Render(body, w)
 		}
 		for _, ln := range strings.Split(body, "\n") {
 			b.WriteString("    " + ln + "\n")
@@ -1719,7 +1772,7 @@ func stringSliceFromAny(vs []any) []string {
 // ---------- key map ----------
 
 type issueKeys struct {
-	Up, Down, Enter, Back, Quit, Help key.Binding
+	Up, Down, Enter, Back, Quit, Help, Settings key.Binding
 
 	TabDesc, TabComments, TabLinks, TabAttachments, TabTransitions key.Binding
 
@@ -1740,8 +1793,9 @@ func defaultIssueKeys() issueKeys {
 		Down:  key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
 		Enter: key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "apply")),
 		Back:  key.NewBinding(key.WithKeys("esc", "h"), key.WithHelp("esc/h", "back")),
-		Quit:  key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
-		Help:  key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+		Help:     key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Settings: key.NewBinding(key.WithKeys(","), key.WithHelp(",", "settings")),
 
 		TabDesc:        key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "description")),
 		TabComments:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "comments")),
@@ -1791,6 +1845,6 @@ func (k issueKeys) FullHelp() [][]key.Binding {
 		{k.AddLink, k.RemoveLink, k.ToggleWatch, k.EditWatchers},
 		{k.UploadAttachment, k.DeleteAttachment, k.OpenBrowser},
 		{k.NewComment, k.EditComment, k.DeleteComment},
-		{k.Up, k.Down, k.Enter, k.Help, k.Back, k.Quit},
+		{k.Up, k.Down, k.Enter, k.Help, k.Settings, k.Back, k.Quit},
 	}
 }
