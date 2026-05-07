@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/huh"
@@ -25,8 +27,100 @@ func newIssueCmd() *cobra.Command {
 		newIssueTransitionCmd(),
 		newIssueStartCmd(),
 		newIssueCurrentCmd(),
+		newIssueCreateCmd(),
 	)
 	return c
+}
+
+// newIssueCreateCmd creates a new issue non-interactively. Project +
+// summary are required; description, epic link, labels and
+// components are optional. Description can be passed inline or read
+// from a file via --description-file (use "-" for stdin).
+func newIssueCreateCmd() *cobra.Command {
+	var (
+		hostFlag        string
+		project         string
+		summary         string
+		issueType       string
+		description     string
+		descriptionFile string
+		epicKey         string
+		labels          []string
+		components      []string
+	)
+	c := &cobra.Command{
+		Use:   "create",
+		Short: "Create a new Jira issue",
+		Long: `Create a new Jira issue and print its key.
+
+Project + summary are required. Description can be inline or read
+from a file (use --description-file=- to read from stdin).
+--epic links the new issue to a parent epic.
+
+Examples:
+  jr issue create -p TVD -s "Build login UI" -t Story --epic TVD-83792
+  jr issue create -p TVD -s "Refactor api" --description-file ./body.md -l backend -l refactor`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if project == "" || summary == "" {
+				return fmt.Errorf("--project and --summary are required")
+			}
+			body := description
+			if descriptionFile != "" {
+				b, err := readDescription(descriptionFile)
+				if err != nil {
+					return err
+				}
+				body = b
+			}
+			svc, err := defaultService(hostFlag)
+			if err != nil {
+				return err
+			}
+			issue, err := svc.CreateIssue(api.CreateIssueInput{
+				Project:     strings.ToUpper(project),
+				Summary:     summary,
+				IssueType:   issueType,
+				Description: body,
+				EpicKey:     strings.ToUpper(epicKey),
+				Labels:      labels,
+				Components:  components,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("✓ created %s — %s\n  %s\n", issue.Key, issue.Summary, issue.WebURL)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&hostFlag, "host", "", "Jira host to use")
+	c.Flags().StringVarP(&project, "project", "p", "", "project key (e.g. TVD) [required]")
+	c.Flags().StringVarP(&summary, "summary", "s", "", "issue summary / title [required]")
+	c.Flags().StringVarP(&issueType, "type", "t", "Story", "issue type (Story, Task, Bug, …)")
+	c.Flags().StringVarP(&description, "description", "d", "", "issue description (wiki markup)")
+	c.Flags().StringVar(&descriptionFile, "description-file", "", "read description from file ('-' for stdin)")
+	c.Flags().StringVarP(&epicKey, "epic", "e", "", "parent epic key to link via Epic Link")
+	c.Flags().StringSliceVarP(&labels, "label", "l", nil, "label (repeatable)")
+	c.Flags().StringSliceVar(&components, "component", nil, "component name (repeatable)")
+	return c
+}
+
+// readDescription reads description body from a file, or stdin when
+// path is "-". Returns the contents as-is (no trim) so callers can
+// preserve trailing newlines if desired.
+func readDescription(path string) (string, error) {
+	if path == "-" {
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 // resolveKey returns the issue key from args[0] when provided, or

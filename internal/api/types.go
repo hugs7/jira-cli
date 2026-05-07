@@ -123,10 +123,16 @@ type SearchInput struct {
 
 // CreateIssueInput is the payload for creating a new issue. Project
 // and Summary are required; IssueType defaults to "Task" when blank.
+// EpicKey, when set, links the issue to a parent epic via Jira's
+// "Epic Link" custom field. Labels and Components are optional.
 type CreateIssueInput struct {
-	Project   string
-	Summary   string
-	IssueType string
+	Project     string
+	Summary     string
+	IssueType   string
+	Description string
+	EpicKey     string
+	Labels      []string
+	Components  []string
 }
 
 // Board is one Jira Software / Agile board (Scrum or Kanban).
