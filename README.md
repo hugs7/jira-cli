@@ -88,6 +88,33 @@ Config lives at `~/.config/jr/config.yml` (override with `--config`).
 
 Per-repo overrides go in `.jr.yml` at the repo root.
 
+## Commands
+
+Run `jr <cmd> --help` for full flags. Highlights:
+
+| Command | What it does |
+|---|---|
+| `jr` | Open the interactive home dashboard (TUI) |
+| `jr auth login` | Authenticate against a Jira host |
+| `jr issue view [KEY]` | Open the interactive issue viewer (KEY defaults to current branch) |
+| `jr issue create -p PROJ -s "..."` | Create a new issue |
+| `jr issue comment [KEY]` | Add a comment via `$EDITOR` |
+| `jr issue transition [KEY]` | Move an issue through its workflow |
+| `jr issue start <KEY>` | Create + checkout a branch named after a Jira issue |
+| `jr issue current` | Print the Jira key implied by the current branch |
+| `jr board [ID]` | Open the Kanban board TUI for a Jira Software board |
+| `jr board list` | Non-interactive board list |
+| `jr filter list` | List your favourite saved filters |
+| `jr filter view <id>` | Show name, owner, JQL, description, viewUrl for a filter |
+| `jr filter create --name X --jql Y [--description Z] [--fav]` | Create a saved filter |
+| `jr filter edit <id> [--name] [--jql] [--description] [--fav\|--no-fav]` | Update fields on a filter (fetch-merge-PUT) |
+| `jr filter delete <id> [-y]` | Delete a filter (prompts unless `-y`) |
+| `jr filter favourite <id>` / `jr filter unfavourite <id>` | Toggle a filter's favourite state |
+| `jr filter results <id> [-L N]` | Run a filter's JQL and print the matching issues |
+| `jr search <JQL>` | Run an ad-hoc JQL query |
+| `jr api <endpoint>` | Call any Jira REST endpoint and print the response |
+| `jr upgrade` | Self-update from GitHub Releases |
+
 ## License
 
 MIT

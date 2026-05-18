@@ -128,3 +128,14 @@ func (c *cloudService) ListBoardSprints(boardID int, state string) ([]Sprint, er
 func (c *cloudService) ListBoardIssues(boardID, sprintID int, jql string, max int) ([]Issue, error) {
 	return []Issue{}, nil
 }
+
+func (c *cloudService) ListFilters(owner string) ([]Filter, error)    { return nil, errCloudTodo }
+func (c *cloudService) GetFilter(id int) (*Filter, error)             { return nil, errCloudTodo }
+func (c *cloudService) CreateFilter(in FilterInput) (*Filter, error)  { return nil, errCloudTodo }
+func (c *cloudService) UpdateFilter(id int, in FilterInput) (*Filter, error) {
+	return nil, errCloudTodo
+}
+func (c *cloudService) DeleteFilter(id int) error { return errCloudTodo }
+func (c *cloudService) SetFilterFavourite(id int, fav bool) (*Filter, error) {
+	return nil, errCloudTodo
+}

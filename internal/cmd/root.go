@@ -84,6 +84,7 @@ func NewRootCmd(info BuildInfo) *cobra.Command {
 		newAuthCmd(),
 		newIssueCmd(),
 		newBoardCmd(),
+		newFilterCmd(),
 		newSearchCmd(),
 		newAPICmd(),
 		newUpgradeCmd(info),
