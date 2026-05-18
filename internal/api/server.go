@@ -22,6 +22,7 @@ type serverService struct {
 	// Custom-field IDs cached after first /field discovery. Empty
 	// strings mean "not yet discovered or absent on this instance".
 	cfStoryPoints string
+	cfEpicLink    string
 	cfDiscovered  bool
 
 	// Per-instance status id→name map, populated lazily by
@@ -306,6 +307,10 @@ func (s *serverService) discoverCustomFields() {
 			s.cfStoryPoints = f.ID
 		case strings.EqualFold(f.Name, "Story point estimate") && s.cfStoryPoints == "":
 			s.cfStoryPoints = f.ID
+		case f.Schema.Custom == "com.pyxis.greenhopper.jira:gh-epic-link":
+			s.cfEpicLink = f.ID
+		case strings.EqualFold(f.Name, "Epic Link") && s.cfEpicLink == "":
+			s.cfEpicLink = f.ID
 		}
 	}
 }
@@ -555,13 +560,34 @@ func (s *serverService) CreateIssue(in CreateIssueInput) (*Issue, error) {
 	if itype == "" {
 		itype = "Task"
 	}
-	body := map[string]any{
-		"fields": map[string]any{
-			"project":   map[string]any{"key": in.Project},
-			"summary":   in.Summary,
-			"issuetype": map[string]any{"name": itype},
-		},
+	fields := map[string]any{
+		"project":   map[string]any{"key": in.Project},
+		"summary":   in.Summary,
+		"issuetype": map[string]any{"name": itype},
 	}
+	if in.Description != "" {
+		fields["description"] = in.Description
+	}
+	if len(in.Labels) > 0 {
+		fields["labels"] = in.Labels
+	}
+	if len(in.Components) > 0 {
+		comps := make([]map[string]any, 0, len(in.Components))
+		for _, c := range in.Components {
+			comps = append(comps, map[string]any{"name": c})
+		}
+		fields["components"] = comps
+	}
+	if in.EpicKey != "" {
+		if !s.cfDiscovered {
+			s.discoverCustomFields()
+		}
+		if s.cfEpicLink == "" {
+			return nil, fmt.Errorf("epic link custom field not found on this instance")
+		}
+		fields[s.cfEpicLink] = in.EpicKey
+	}
+	body := map[string]any{"fields": fields}
 	var raw struct {
 		Key string `json:"key"`
 	}
