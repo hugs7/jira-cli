@@ -152,6 +152,19 @@ type Service interface {
 	GetBoardConfig(boardID int) (*BoardConfig, error)
 	ListBoardSprints(boardID int, state string) ([]Sprint, error)
 	ListBoardIssues(boardID int, sprintID int, jqlFilter string, max int) ([]Issue, error)
+
+	// --- Saved filters ---
+	//
+	// Filters are JQL searches saved server-side. Empty owner in
+	// ListFilters returns the authenticated user's favourites;
+	// owner == "me" or a username scopes to that user via
+	// /filter/search.
+	ListFilters(owner string) ([]Filter, error)
+	GetFilter(id int) (*Filter, error)
+	CreateFilter(in FilterInput) (*Filter, error)
+	UpdateFilter(id int, in FilterInput) (*Filter, error)
+	DeleteFilter(id int) error
+	SetFilterFavourite(id int, fav bool) (*Filter, error)
 }
 
 // NewService picks the right implementation for a configured host.
