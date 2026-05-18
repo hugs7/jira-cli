@@ -158,6 +158,16 @@ type BoardConfig struct {
 	Columns []BoardColumn
 }
 
+// CreateBoardInput is the payload for creating a new board. Name +
+// FilterID are required; Type is "scrum" or "kanban" (default
+// "scrum"). The filter should be shared (e.g. AUTHENTICATED) for
+// the board to be useful to other viewers.
+type CreateBoardInput struct {
+	Name     string
+	Type     string
+	FilterID int
+}
+
 // Sprint is one iteration on a Scrum board.
 type Sprint struct {
 	ID    int

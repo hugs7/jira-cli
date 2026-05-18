@@ -198,3 +198,22 @@ func (s *serverService) SetFilterFavourite(id int, fav bool) (*Filter, error) {
 var ErrFavouriteNotToggled = fmt.Errorf("server ignored favourite change " +
 	"(this Jira version does not honour the favourite field on PUT; " +
 	"toggle it from the Jira web UI instead)")
+
+// FilterShareInput is the body for POST /rest/api/2/filter/{id}/permission.
+// Type must be one of: global, authenticated, project, group, projectRole,
+// user. Target meaning depends on type — projectId for project, groupname
+// for group, etc. — and is ignored for global / authenticated shares.
+type FilterShareInput struct {
+	Type        string `json:"type"`
+	ProjectID   string `json:"projectId,omitempty"`
+	GroupName   string `json:"groupname,omitempty"`
+	ProjectRole string `json:"projectRoleId,omitempty"`
+	User        string `json:"userName,omitempty"`
+}
+
+// AddFilterPermission grants the given share type on a filter. Used
+// to make a private filter visible to a board ("authenticated"
+// shares are the common default).
+func (s *serverService) AddFilterPermission(id int, in FilterShareInput) error {
+	return s.client.postJSON(fmt.Sprintf("filter/%d/permission", id), in, nil)
+}

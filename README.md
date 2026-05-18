@@ -104,6 +104,7 @@ Run `jr <cmd> --help` for full flags. Highlights:
 | `jr issue current` | Print the Jira key implied by the current branch |
 | `jr board [ID]` | Open the Kanban board TUI for a Jira Software board |
 | `jr board list` | Non-interactive board list |
+| `jr board create --name X --filter ID [--type scrum\|kanban]` | Create a new board backed by an existing filter |
 | `jr filter list` | List your favourite saved filters |
 | `jr filter view <id>` | Show name, owner, JQL, description, viewUrl for a filter |
 | `jr filter create --name X --jql Y [--description Z] [--fav]` | Create a saved filter |
@@ -111,6 +112,7 @@ Run `jr <cmd> --help` for full flags. Highlights:
 | `jr filter delete <id> [-y]` | Delete a filter (prompts unless `-y`) |
 | `jr filter favourite <id>` / `jr filter unfavourite <id>` | Toggle a filter's favourite state |
 | `jr filter results <id> [-L N]` | Run a filter's JQL and print the matching issues |
+| `jr filter share <id> [--type authenticated\|global\|project\|group\|projectrole\|user] [--target ...]` | Grant a share permission on a filter |
 | `jr search <JQL>` | Run an ad-hoc JQL query |
 | `jr api <endpoint>` | Call any Jira REST endpoint and print the response |
 | `jr upgrade` | Self-update from GitHub Releases |

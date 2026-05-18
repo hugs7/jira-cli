@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
@@ -72,7 +73,59 @@ With no ID, jr lists the available boards (optionally filtered by
 		}
 	}
 
-	c.AddCommand(newBoardListCmd())
+	c.AddCommand(newBoardListCmd(), newBoardCreateCmd())
+	return c
+}
+
+// newBoardCreateCmd creates a new Jira Software board backed by an
+// existing filter. The filter must be shared (run `jr filter share
+// <id>` first) for the board to be visible to anyone but the owner.
+func newBoardCreateCmd() *cobra.Command {
+	var hostFlag, name, kind string
+	var filterID int
+	c := &cobra.Command{
+		Use:   "create",
+		Short: "Create a new board backed by an existing filter",
+		Long: `Create a new Jira Software board.
+
+The board needs an existing saved filter to scope its issues. If
+the filter isn't shared yet, run "jr filter share <id>" first or
+the board will only render for the filter owner.
+
+Examples:
+  jr board create --name "Hugo's Product Switch Board" --filter 266068 --type scrum
+  jr board create -n "TVD Kanban" --filter 253986 --type kanban`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if name == "" || filterID == 0 {
+				return fmt.Errorf("--name and --filter are required")
+			}
+			t := strings.ToLower(kind)
+			if t != "scrum" && t != "kanban" {
+				return fmt.Errorf("--type must be scrum or kanban, got %q", kind)
+			}
+			svc, err := defaultService(hostFlag)
+			if err != nil {
+				return err
+			}
+			b, err := svc.CreateBoard(api.CreateBoardInput{
+				Name:     name,
+				Type:     t,
+				FilterID: filterID,
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Printf("✓ created board %d — %s (%s)\n", b.ID, b.Name, b.Type)
+			fmt.Printf("  %s/secure/RapidBoard.jspa?rapidView=%d&useStoredSettings=true\n",
+				svc.WebBase(), b.ID)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&hostFlag, "host", "", "Jira host to use")
+	c.Flags().StringVarP(&name, "name", "n", "", "board name [required]")
+	c.Flags().IntVar(&filterID, "filter", 0, "filter id to back the board [required]")
+	c.Flags().StringVarP(&kind, "type", "t", "scrum", "board type: scrum or kanban")
 	return c
 }
 

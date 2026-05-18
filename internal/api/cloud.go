@@ -139,3 +139,9 @@ func (c *cloudService) DeleteFilter(id int) error { return errCloudTodo }
 func (c *cloudService) SetFilterFavourite(id int, fav bool) (*Filter, error) {
 	return nil, errCloudTodo
 }
+func (c *cloudService) AddFilterPermission(id int, in FilterShareInput) error {
+	return errCloudTodo
+}
+func (c *cloudService) CreateBoard(in CreateBoardInput) (*Board, error) {
+	return nil, errCloudTodo
+}

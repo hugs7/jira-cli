@@ -152,6 +152,9 @@ type Service interface {
 	GetBoardConfig(boardID int) (*BoardConfig, error)
 	ListBoardSprints(boardID int, state string) ([]Sprint, error)
 	ListBoardIssues(boardID int, sprintID int, jqlFilter string, max int) ([]Issue, error)
+	// CreateBoard creates a new Jira Software board backed by an
+	// existing filter (which must be shared for other viewers).
+	CreateBoard(in CreateBoardInput) (*Board, error)
 
 	// --- Saved filters ---
 	//
@@ -165,6 +168,9 @@ type Service interface {
 	UpdateFilter(id int, in FilterInput) (*Filter, error)
 	DeleteFilter(id int) error
 	SetFilterFavourite(id int, fav bool) (*Filter, error)
+	// AddFilterPermission grants the given share permission on a
+	// filter (e.g. authenticated, project, group, user).
+	AddFilterPermission(id int, in FilterShareInput) error
 }
 
 // NewService picks the right implementation for a configured host.

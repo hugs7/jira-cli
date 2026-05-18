@@ -28,6 +28,7 @@ func newFilterCmd() *cobra.Command {
 		newFilterFavouriteCmd(),
 		newFilterUnfavouriteCmd(),
 		newFilterResultsCmd(),
+		newFilterShareCmd(),
 	)
 	return c
 }
@@ -433,5 +434,72 @@ func newFilterResultsCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&hostFlag, "host", "", "Jira host to use")
 	c.Flags().IntVarP(&limit, "limit", "L", 50, "maximum results to return")
+	return c
+}
+
+func newFilterShareCmd() *cobra.Command {
+	var hostFlag, shareType, project, group, user, role string
+	c := &cobra.Command{
+		Use:   "share <id>",
+		Short: "Grant a share permission on a filter",
+		Long: `Grant a share permission on a filter so other users can see it.
+Required for Jira Software boards backed by the filter — without
+this the board only renders for the filter owner.
+
+Examples:
+  jr filter share 266068                       # default: authenticated (any logged-in user)
+  jr filter share 266068 --type project --project 12345
+  jr filter share 266068 --type group --group "TVD Devs"
+  jr filter share 266068 --type user --user F083814`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			id, err := parseFilterID(args[0])
+			if err != nil {
+				return err
+			}
+			svc, err := defaultService(hostFlag)
+			if err != nil {
+				return err
+			}
+			in := api.FilterShareInput{Type: strings.ToLower(shareType)}
+			switch in.Type {
+			case "project":
+				if project == "" {
+					return fmt.Errorf("--project is required for --type project")
+				}
+				in.ProjectID = project
+			case "group":
+				if group == "" {
+					return fmt.Errorf("--group is required for --type group")
+				}
+				in.GroupName = group
+			case "user":
+				if user == "" {
+					return fmt.Errorf("--user is required for --type user")
+				}
+				in.User = user
+			case "projectrole":
+				if role == "" {
+					return fmt.Errorf("--role is required for --type projectrole")
+				}
+				in.ProjectRole = role
+			case "global", "authenticated":
+				// no extra fields needed
+			default:
+				return fmt.Errorf("unknown --type %q (want one of: authenticated, global, project, group, projectrole, user)", shareType)
+			}
+			if err := svc.AddFilterPermission(id, in); err != nil {
+				return err
+			}
+			fmt.Printf("✓ added %s share permission to filter %d\n", in.Type, id)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&hostFlag, "host", "", "Jira host to use")
+	c.Flags().StringVar(&shareType, "type", "authenticated", "share type: authenticated, global, project, group, projectrole, user")
+	c.Flags().StringVar(&project, "project", "", "project id (for --type project)")
+	c.Flags().StringVar(&group, "group", "", "group name (for --type group)")
+	c.Flags().StringVar(&user, "user", "", "username (for --type user)")
+	c.Flags().StringVar(&role, "role", "", "project role id (for --type projectrole)")
 	return c
 }

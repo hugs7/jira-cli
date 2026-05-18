@@ -1096,6 +1096,27 @@ func (s *serverService) ListBoards(projectKey, kind string, max int) ([]Board, e
 	}
 }
 
+// CreateBoard creates a new Jira Software board backed by an
+// existing filter. Jira requires the filter to be shared (e.g. to
+// authenticated users) but doesn't block creation if it isn't —
+// the board just won't return issues for other viewers.
+func (s *serverService) CreateBoard(in CreateBoardInput) (*Board, error) {
+	body := map[string]any{
+		"name":     in.Name,
+		"type":     strings.ToLower(in.Type),
+		"filterId": in.FilterID,
+	}
+	var resp struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+		Type string `json:"type"`
+	}
+	if err := s.client.postJSON(s.agileURL("board"), body, &resp); err != nil {
+		return nil, err
+	}
+	return &Board{ID: resp.ID, Name: resp.Name, Type: resp.Type}, nil
+}
+
 type srvBoardConfig struct {
 	ID           int    `json:"id"`
 	Name         string `json:"name"`
